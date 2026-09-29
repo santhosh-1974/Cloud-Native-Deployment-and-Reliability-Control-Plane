@@ -253,3 +253,70 @@ These are architecture/document corrections only; no implementation or requireme
 The architecture has a viable high-level component split, a suitable canary traffic mechanism, appropriate durable-state intent, and a coherent reconciliation direction. It does not yet guarantee atomic idempotency, safe concurrent promotion/rollback, complete crash recovery at traffic side-effect boundaries, bounded outage handling, or verified traffic-state semantics. Multiple requirements therefore remain **PARTIAL**.
 
 `ARCHITECTURE REQUIRES CHANGES`
+## 17. Superseding Re-review (RC-01 through RC-09)
+
+This section supersedes the earlier status findings. Evidence is in corrected Architecture Section 24. Requirements are unchanged.
+
+### RC results
+
+- RC-01 PASS: atomic PostgreSQL identity lookup/create and per-app reservation; concurrent duplicate returns one deployment.
+- RC-02 PASS: durable stage substates; persist intent, act, observe, acknowledge; observe before retry on restart.
+- RC-03 PASS: single DB-owned coordinator, monotonic revision, expected-state checks, ownership and Kubernetes resourceVersion checks before writes; stale results rejected.
+- RC-04 PASS: desired/applied/observed traffic distinguished; ALB generation gates evaluation and rollback; final 100%, verify, health PASS, then SUCCEEDED.
+- RC-05 PASS: configurable retry/exhaustion, fail-closed dependencies, no stale/missing PASS, no indefinite VALIDATING.
+- RC-06 PASS: Redis removed from MVP; PostgreSQL serializes; no queue.
+- RC-07 PASS: caller, CI, workload, platform, ALB and DB identities separated.
+- RC-08 PASS: deployment/version/stage/revision/window-specific metrics; v1/v2 distinguishable; freshness and restart window defined.
+- RC-09 PASS: baseline profile and API/controller timestamps defined; p95 targets provisional, not claimed achieved.
+
+### Updated FR/NFR traceability
+
+All IDs below are PASS; evidence applies to every listed ID.
+
+| IDs | Evidence |
+|---|---|
+| FR-01, FR-02, FR-03 | API registration, durable config and retrieval. |
+| FR-04, FR-05, FR-06, FR-07, FR-08 | Request/image persistence, lifecycle tracking and details. |
+| FR-09, FR-10, FR-34 | Atomic active reservation and identity lookup/create-or-return. |
+| FR-11, FR-12, FR-13, FR-14, FR-15 | Resource control, desired/actual reconcile, bounded failures and recovery. |
+| FR-16, FR-17, FR-18, FR-19 | Coexisting versions, weighted stages, verified health windows. |
+| FR-20, FR-21 | Each stage gated; final gate ordered; failure fences promotion. |
+| FR-22, FR-23, FR-24 | Required sources, freshness/missing rules, scoped persisted evaluation. |
+| FR-25, FR-26, FR-27, FR-28, FR-29, FR-30 | Failure reason, fenced halt, verified/idempotent rollback. |
+| FR-31, FR-32, FR-33 | Legal terminal states, pod recovery, durable stage protocol. |
+| FR-35, FR-36, FR-37 | Desired/observed status, events, health/rollback detail. |
+| NFR-01, NFR-02, NFR-03 | Durable recovery, idempotency, reconciliation. |
+| NFR-04, NFR-07 | Workload isolation and bounded work across different apps. |
+| NFR-05, NFR-06 | Provisional p95 fixture, timestamps, exclusions. |
+| NFR-08, NFR-09 | API auth and app-owner authorization. |
+| NFR-10, NFR-14 | Sensitive fields excluded/redacted. |
+| NFR-11, NFR-12, NFR-13 | Separate scoped CI/workload/controller/ALB identities. |
+| NFR-15, NFR-16 | Correlated diagnostics and durable PostgreSQL recovery state. |
+
+### Flow and safety re-check
+
+Success: CI publishes image; API atomically commits PENDING; controller records intent, creates target, applies and observes ALB weights, persists fresh PASS at each stage. At final stage: request 100%, verify, evaluate final window, PASS, then SUCCEEDED.
+
+Failure: health failure and reason commit CANARY_FAILED at a new revision; stale promotion is rejected; rollback intent precedes weight mutation; ALB verifies stable 100% / target 0%; only then ROLLED_BACK. Exhausted/unverified rollback is FAILED.
+
+Desired traffic is durable PostgreSQL intent; applied traffic is reconciled Ingress generation; verified traffic is ALB/controller observation. Ingress spec alone is insufficient. API reports desired and observed separately. Health sources distinguish v1/v2 and bind results to deployment/version/stage/revision/window. Missing/stale data cannot pass. PostgreSQL keeps app, versions, state/revision, stage/substate, operation, weights, health window/result, rollback and events for recovery.
+
+### Crash, race and failure re-check
+
+Crash 1 (intent only): replacement observes, then acts/acknowledges. Crash 2 (ALB changed, no DB ack): observe generation, acknowledge match or retry same revision. Crash 3 (evaluation active): accept complete fresh result or restart attempt. Crash 4 (PASS before promotion): conditionally continue if durable/current, else reevaluate. Crash 5 (rollback): reload, observe/reapply/verify, then ROLLED_BACK or FAILED.
+
+Races: same-app requests use atomic reservation; duplicate workers are serialized; rollback revision rejects promotion; delayed PASS is stale; ALB crash recovery observes first; Redis expiry is N/A; actual/desired divergence reconciles or fails closed.
+
+Failure cases rechecked: Pod crash blocks promotion; controller crash recovers DB state; Kubernetes/Prometheus/ALB outage retries without unsafe progress; missing health is indeterminate; canary failure rolls back; rollback failure is FAILED; duplicate create/rollback is idempotent; partial promotion observes before retry; DB outage stops uncommitted writes; Redis outage is N/A.
+
+### Security and performance re-check
+
+Caller, GitHub Actions, EKS workload, platform controller, AWS Load Balancer Controller and PostgreSQL have distinct access boundaries. CI has no EKS access; workload has no control-plane DB access by default. Sensitive fields are excluded/redacted. Exact credentials and IAM/RBAC policies remain deferred implementation details.
+
+The 500 ms API p95 and 30 s controller reaction p95 are provisional. Section 24 defines measurement profile, timestamps, external exclusions and reporting; it does not claim achievement. No architecture-level requirement remains uncovered. Schema, metric names, thresholds, policy values, credentials/policies and measured capacity are implementation/configuration decisions; requirements are unchanged.
+
+## 18. Final Verdict
+
+All RCs pass; all FR/NFR IDs are mapped to architecture mechanisms; success, failure, rollback, crash recovery, idempotency, reconciliation, health, persistence, races and security are coherent.
+
+ARCHITECTURE APPROVED
