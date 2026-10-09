@@ -1,8 +1,328 @@
-// Initial foundation intentionally defines no deployment-domain models.
+// =============================================================================
+// Cloud-Native Deployment & Reliability Control Plane — Domain Model
+// Phase 1, Step 2: Database & Domain Model
+// =============================================================================
+
 generator client {
   provider = "prisma-client-js"
 }
+
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+/// Deployment lifecycle state machine.
+/// Valid transitions are enforced by the controller at the application layer.
+enum DeploymentStatus {
+  PENDING
+  DEPLOYING
+  CANARY
+  VALIDATING
+  PROMOTING
+  SUCCEEDED
+  CANARY_FAILED
+  ROLLING_BACK
+  ROLLED_BACK
+  FAILED
+}
+
+/// Durable sub-state for each canary stage operation.
+/// Encodes the persist-intent → side-effect → observe → acknowledge protocol.
+enum StageStatus {
+  UNEVALUATED
+  INTENT_RECORDED
+  APPLYING
+  APPLIED
+  VALIDATING
+  PASSED
+  FAILED
+}
+
+/// Health evaluation result produced by the Health Monitor.
+enum EvaluationResult {
+  PASS
+  FAIL
+  INDETERMINATE
+}
+
+/// Canonical deployment event types for the append-only event log.
+enum DeploymentEventType {
+  DEPLOYMENT_CREATED
+  DEPLOYMENT_STARTED
+  STAGE_INTENT_RECORDED
+  TRAFFIC_APPLY_STARTED
+  TRAFFIC_APPLIED
+  TRAFFIC_VERIFIED
+  HEALTH_VALIDATION_STARTED
+  HEALTH_VALIDATION_PASSED
+  HEALTH_VALIDATION_FAILED
+  PROMOTION_STARTED
+  ROLLBACK_STARTED
+  ROLLBACK_VERIFIED
+  DEPLOYMENT_SUCCEEDED
+  DEPLOYMENT_FAILED
+  DEPLOYMENT_ROLLED_BACK
+}
+
+// ---------------------------------------------------------------------------
+// Application
+// ---------------------------------------------------------------------------
+
+/// A deployable workload managed by the platform.
+/// Configuration is stored as a non-secret JSON object.  Secrets (ECR
+/// credentials, TLS certs, etc.) must NOT be stored here — that mechanism
+/// is deferred to a future secrets-management integration.
+model Application {
+  id        String   @id @default(uuid())
+  /// Human-readable, caller-supplied identifier — unique across the platform.
+  name      String   @unique
+
+  /// Non-secret deployment configuration supplied at registration time
+  /// (e.g. default replicas, port, namespace hints).  Must never contain
+  /// credentials or tokens.
+  config    Json     @default("{}")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt      @map("updated_at")
+
+  deployments Deployment[]
+
+  @@map("applications")
+}
+
+// ---------------------------------------------------------------------------
+// Deployment
+// ---------------------------------------------------------------------------
+
+/// One requested rollout for an Application.
+/// Implements idempotency via a unique request_identity constraint so that
+/// retrying the same request returns the existing Deployment.
+/// Active-deployment-per-application is enforced by the partial unique index
+/// `idx_deployments_one_active_per_app` together with a serialised
+/// transaction (SELECT FOR UPDATE on the application row + INSERT) — the
+/// index alone cannot express "at most one non-terminal row per app" in all
+/// Postgres versions portably, so the application transaction is the primary
+/// enforcement mechanism and the index is a secondary best-effort guard.
+model Deployment {
+  id              String           @id @default(uuid())
+
+  /// FK to the owning Application.
+  applicationId   String           @map("application_id")
+  application     Application      @relation(fields: [applicationId], references: [id])
+
+  /// Caller-supplied or server-derived idempotency key.
+  /// A unique constraint guarantees that two concurrent requests with the
+  /// same key cannot both INSERT a new Deployment row.
+  requestIdentity String           @unique @map("request_identity")
+
+  // ---- Version identifiers -------------------------------------------------
+  /// Target container image reference (e.g. 123.dkr.ecr…/app:v2).
+  targetImage     String           @map("target_image")
+  /// Previous healthy image reference, persisted for rollback.
+  stableImage     String?          @map("stable_image")
+
+  // ---- Replica / port / strategy -------------------------------------------
+  desiredReplicas Int              @map("desired_replicas")
+  port            Int
+  /// Deployment strategy stored as JSON (type + canary steps array).
+  strategy        Json
+
+  // ---- Lifecycle -----------------------------------------------------------
+  status          DeploymentStatus @default(PENDING)
+  /// Index of the stage currently being processed (0-based).
+  currentStageIndex Int?           @map("current_stage_index")
+
+  // ---- Revision / fencing --------------------------------------------------
+  /// Monotonic counter incremented on every lifecycle transition.
+  /// A controller worker must read this value and include it as the
+  /// WHERE condition before mutating deployment state:
+  ///   UPDATE deployments
+  ///   SET    status = $newStatus, revision = revision + 1
+  ///   WHERE  id = $id AND revision = $expectedRevision
+  /// A stale worker sees 0 rows updated and must reload state before retrying.
+  revision        Int              @default(0)
+
+  // ---- Rollback information ------------------------------------------------
+  /// Human-readable reason for canary failure / rollback.
+  rollbackReason  String?          @map("rollback_reason")
+  /// Outcome of the rollback attempt (e.g. 'VERIFIED', 'FAILED').
+  rollbackOutcome String?          @map("rollback_outcome")
+
+  // ---- Timestamps ----------------------------------------------------------
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt      @map("updated_at")
+  completedAt     DateTime?        @map("completed_at")
+
+  stages          DeploymentStage[]
+  healthEvaluations HealthEvaluation[]
+  events          DeploymentEvent[]
+
+  // Composite index: look up all non-terminal deployments per application
+  // efficiently (used by the controller to discover active work).
+  @@index([applicationId, status], name: "idx_deployments_by_app_status")
+  // Fast lookup of a single deployment by application (most recent first).
+  @@index([applicationId, createdAt(sort: Desc)], name: "idx_deployments_by_app")
+  // Request-identity lookups are served by the unique constraint above.
+
+  @@map("deployments")
+}
+
+// ---------------------------------------------------------------------------
+// DeploymentStage
+// ---------------------------------------------------------------------------
+
+/// One ordered canary step within a Deployment.
+/// Persists the full persist-intent → side-effect → observe → acknowledge
+/// protocol so that a controller crash can be recovered without losing
+/// whether a traffic change was intended, applied, and verified.
+model DeploymentStage {
+  id           String      @id @default(uuid())
+
+  deploymentId String      @map("deployment_id")
+  deployment   Deployment  @relation(fields: [deploymentId], references: [id])
+
+  /// 0-based position within the stage sequence.
+  stageIndex   Int         @map("stage_index")
+
+  // ---- Desired traffic (PostgreSQL intent) ---------------------------------
+  /// Target canary traffic percentage requested for this stage (0–100).
+  desiredCanaryPct  Int     @map("desired_canary_pct")
+  /// Complementary stable traffic percentage (100 − desiredCanaryPct for
+  /// normal stages; may differ during rollback).
+  desiredStablePct  Int     @map("desired_stable_pct")
+
+  // ---- Applied traffic (Kubernetes / ALB Ingress spec) ---------------------
+  /// Canary percentage that was written to the Ingress/ALB config.
+  appliedCanaryPct  Int?    @map("applied_canary_pct")
+  appliedStablePct  Int?    @map("applied_stable_pct")
+
+  // ---- Observed / verified traffic (ALB data-plane observation) -----------
+  /// Canary percentage as reported by the ALB/controller observation.
+  /// Null means not yet verified; never present desired as observed.
+  observedCanaryPct Int?    @map("observed_canary_pct")
+  observedStablePct Int?    @map("observed_stable_pct")
+
+  // ---- Stage sub-state and operation checkpoint ----------------------------
+  status       StageStatus @default(UNEVALUATED)
+
+  /// Unique identity for this stage operation attempt (UUID).
+  /// Allows the controller to detect if an operation was already initiated
+  /// under the same operationId before issuing an external write.
+  operationId  String?     @map("operation_id")
+  /// The deployment revision at which this stage operation was recorded.
+  /// Used to reject stale operation retries after a revision increment.
+  operationRevision Int?   @map("operation_revision")
+  /// How many apply-attempts have been made for this stage.
+  applyAttempt Int         @default(0) @map("apply_attempt")
+
+  // ---- Validation window ---------------------------------------------------
+  /// When the validation window started (after traffic was verified).
+  validationStartedAt DateTime? @map("validation_started_at")
+  /// When the validation window closed.
+  validationEndedAt   DateTime? @map("validation_ended_at")
+
+  // ---- Completion ----------------------------------------------------------
+  completedAt  DateTime?   @map("completed_at")
+  /// Human-readable failure reason if this stage failed.
+  failureReason String?    @map("failure_reason")
+
+  createdAt    DateTime    @default(now()) @map("created_at")
+  updatedAt    DateTime    @updatedAt      @map("updated_at")
+
+  healthEvaluations HealthEvaluation[]
+
+  /// Each stage is unique within a deployment (no duplicate stage indices).
+  @@unique([deploymentId, stageIndex], name: "uq_stage_per_deployment")
+  /// Look up all stages for a deployment ordered by stageIndex.
+  @@index([deploymentId, stageIndex], name: "idx_stages_by_deployment")
+
+  @@map("deployment_stages")
+}
+
+// ---------------------------------------------------------------------------
+// HealthEvaluation
+// ---------------------------------------------------------------------------
+
+/// One health evaluation produced by the Health Monitor for a specific
+/// deployment + stage + revision + time window.
+/// A result is only accepted by the controller if the deployment is still
+/// at the same revision and lifecycle/stage is still VALIDATING.
+model HealthEvaluation {
+  id             String           @id @default(uuid())
+
+  deploymentId   String           @map("deployment_id")
+  deployment     Deployment       @relation(fields: [deploymentId], references: [id])
+
+  stageId        String           @map("stage_id")
+  stage          DeploymentStage  @relation(fields: [stageId], references: [id])
+
+  /// Deployment revision at which this evaluation was started.
+  /// The controller must discard this result if the current revision differs.
+  deploymentRevision Int          @map("deployment_revision")
+
+  // ---- Time window ---------------------------------------------------------
+  windowStart    DateTime         @map("window_start")
+  windowEnd      DateTime?        @map("window_end")
+
+  // ---- Result --------------------------------------------------------------
+  result         EvaluationResult
+  /// Whether this result is still considered fresh (i.e., within the
+  /// configured staleness window).  The controller sets this to false
+  /// before persisting a new evaluation for the same stage.
+  isFresh        Boolean          @default(true) @map("is_fresh")
+  /// Human-readable reason for FAIL or INDETERMINATE results.
+  failureReason  String?          @map("failure_reason")
+
+  // ---- Signal observations (structured JSON) -------------------------------
+  /// Stores the individual signal observations (error rate, latency p99,
+  /// pod readiness count, pod restart count, etc.) as a JSON object.
+  /// Shape is intentionally flexible because metric names and signal types
+  /// are implementation decisions deferred to the Health Monitor integration.
+  /// Example: { "errorRate": 0.02, "latencyP99Ms": 145, "readyPods": 3, "restartCount": 0 }
+  observations   Json             @default("{}")
+
+  createdAt      DateTime         @default(now()) @map("created_at")
+  updatedAt      DateTime         @updatedAt      @map("updated_at")
+
+  /// Compound index: fast lookup of all evaluations for a given deployment +
+  /// stage, ordered by creation time (most recent first for freshness check).
+  @@index([deploymentId, stageId, createdAt(sort: Desc)], name: "idx_health_evals_by_stage")
+  /// Index to find all evaluations for a given revision (for stale detection).
+  @@index([deploymentId, deploymentRevision], name: "idx_health_evals_by_revision")
+
+  @@map("health_evaluations")
+}
+
+// ---------------------------------------------------------------------------
+// DeploymentEvent
+// ---------------------------------------------------------------------------
+
+/// Append-only audit log entry for a Deployment.
+/// Events are never updated or deleted; they provide a diagnostic history
+/// of what happened during a deployment without exposing secrets.
+model DeploymentEvent {
+  id           String              @id @default(uuid())
+
+  deploymentId String              @map("deployment_id")
+  deployment   Deployment          @relation(fields: [deploymentId], references: [id])
+
+  eventType    DeploymentEventType @map("event_type")
+
+  /// Optional structured context for this event (stage index, traffic
+  /// percentages, failure reason, etc.).  Must NEVER contain secrets.
+  payload      Json                @default("{}")
+
+  occurredAt   DateTime            @default(now()) @map("occurred_at")
+
+  /// Look up all events for a deployment in chronological order.
+  @@index([deploymentId, occurredAt], name: "idx_events_by_deployment")
+  /// Filter events by type across deployments (e.g. find all rollbacks).
+  @@index([eventType, occurredAt(sort: Desc)], name: "idx_events_by_type")
+
+  @@map("deployment_events")
 }

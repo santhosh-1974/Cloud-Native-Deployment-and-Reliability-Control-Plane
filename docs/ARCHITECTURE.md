@@ -184,6 +184,8 @@ Each stage intent/evaluation is durable before moving to the next. On restart, t
 
 ## 8. Deployment State Machine
 
+This section is the architecture-level legal transition set. It matches `docs/CONTROLLER_STATE_MACHINE_DESIGN.md`. Lifecycle status and `trafficSafety` are separate facts: a lifecycle value never substitutes for a traffic-safety value.
+
 ```mermaid
 stateDiagram-v2
     [*] --> PENDING
@@ -191,20 +193,17 @@ stateDiagram-v2
     PENDING --> FAILED
     DEPLOYING --> CANARY
     DEPLOYING --> FAILED
+    DEPLOYING --> CANARY_FAILED: initial traffic may have been exposed
     CANARY --> VALIDATING
     CANARY --> CANARY_FAILED
-    CANARY --> FAILED
-    VALIDATING --> PROMOTING: required signals pass
-    VALIDATING --> CANARY_FAILED: configured condition fails
-    VALIDATING --> FAILED: unrecoverable pre-rollback failure
-    PROMOTING --> VALIDATING: next stage applied/observed
-    PROMOTING --> VALIDATING: final 100% applied/verified
-    VALIDATING --> SUCCEEDED: final-stage health PASS for current revision
-    PROMOTING --> CANARY_FAILED: required health failure observed
-    PROMOTING --> FAILED: unrecoverable promotion failure
+    VALIDATING --> PROMOTING: non-final stage PASS
+    VALIDATING --> SUCCEEDED: final-stage PASS after verified 100%
+    VALIDATING --> CANARY_FAILED: required health condition fails
+    PROMOTING --> VALIDATING: next stage applied and observed
+    PROMOTING --> CANARY_FAILED: failure after possible traffic exposure
     CANARY_FAILED --> ROLLING_BACK
-    ROLLING_BACK --> ROLLED_BACK: stable traffic restored and verified
-    ROLLING_BACK --> FAILED: rollback cannot be completed
+    ROLLING_BACK --> ROLLED_BACK: stable 100% / target 0% verified
+    ROLLING_BACK --> FAILED: rollback policy exhausted
     SUCCEEDED --> [*]
     ROLLED_BACK --> [*]
     FAILED --> [*]
@@ -212,18 +211,20 @@ stateDiagram-v2
 
 | State | Entry condition | Allowed actions | Valid transitions | Exit condition |
 |---|---|---|---|---|
-| `PENDING` | Request accepted and durably stored. | Validate conflict/idempotency; schedule controller work. | `DEPLOYING`, `FAILED`. | Work begins or pre-deployment validation/process failure is recorded. |
-| `DEPLOYING` | Controller starts creating target workload resources. | Create/update target Deployment and supporting Service; observe pod readiness. | `CANARY`, `FAILED`. | Target is ready enough to enter canary, or deployment failure is recorded. |
-| `CANARY` | Target and prior stable version coexist; initial below-100% weight is applied. | Observe applied weight; begin health evaluation. | `VALIDATING`, `CANARY_FAILED`, `FAILED`. | Stage is ready for validation, configured health failure is detected, or an unrecoverable deployment failure occurs. |
-| `VALIDATING` | Health Monitor is evaluating the current applied traffic stage. | Gather configured signals; persist evaluation; wait/retry missing transient measurements without promotion. | `PROMOTING`, `CANARY_FAILED`, `FAILED`. | All required conditions pass; a configured condition fails; or unrecoverable failure occurs. |
-| `PROMOTING` | The preceding stage passed, and controller is applying the next weight, including final 100%. | Persist stage intent; apply conditionally; observe/verify ALB routing. | `VALIDATING`, `CANARY_FAILED`, `FAILED`. | The next weight is verified and its validation starts; failure is recorded. There is no direct transition to success. |
-| `SUCCEEDED` | Final 100% traffic was observed/verified and the final-stage health evaluation passed at the current revision. | Read/emit status and terminal event. | None. | Terminal. |
-| `CANARY_FAILED` | A required configured health condition failed. | Persist reason; prohibit further promotion; dispatch rollback. | `ROLLING_BACK`. | Rollback begins. |
-| `ROLLING_BACK` | Rollback action is underway. | Idempotently set target to 0% and previous healthy version to 100%; observe result; retry/reconcile. | `ROLLED_BACK`, `FAILED`. | Restored traffic is verified or rollback failure is recorded. |
-| `ROLLED_BACK` | Previous version has verified 100% traffic and target has 0%. | Read/emit terminal status and rollback details. | None. | Terminal. |
-| `FAILED` | Deployment failed before normal completion, or rollback could not be completed. | Preserve failure/rollback detail; expose status for operator diagnosis. | None. | Terminal in this lifecycle; any later retry is a new request/deployment subject to conflict/idempotency rules. |
+| `PENDING` | Request accepted and durably stored. | Validate conflict/idempotency; schedule controller work. | `DEPLOYING`, `FAILED`. | Work begins or a permanent pre-deployment failure is recorded. |
+| `DEPLOYING` | Controller starts creating target workload resources. | Create/update target Deployment and supporting Service; observe pod readiness; persist and apply initial below-100% traffic only after readiness. | `CANARY`, `FAILED`, `CANARY_FAILED`. | Target is ready, initial canary traffic is applied and verified (`CANARY`); failure is terminal with evidence that target traffic was never exposed (`FAILED`); or initial traffic may have been exposed (`CANARY_FAILED`). |
+| `CANARY` | Target and prior stable version coexist; initial below-100% weight is applied and verified. | Observe current stage weights; start the evaluation window only after verification. | `VALIDATING`, `CANARY_FAILED`. | Stage is ready for validation, or a required health or post-exposure failure is recorded and rollback is required. |
+| `VALIDATING` | Health Monitor is evaluating the current applied traffic stage. | Gather configured signals; persist evaluation; wait/retry missing transient measurements without promotion. | `PROMOTING`, `SUCCEEDED`, `CANARY_FAILED`. | A fresh complete PASS at a non-final stage; a fresh complete PASS at the final stage after verified 100% target traffic; or a required condition or missing-data failure that requires rollback. |
+| `PROMOTING` | The preceding non-final stage passed, and the controller is applying the next weight, including final 100%. | Persist stage intent; apply conditionally; observe/verify ALB routing. | `VALIDATING`, `CANARY_FAILED`. | The next weight is verified and its validation starts, or a permanent promotion failure after possible exposure is recorded. There is no transition to `SUCCEEDED` from `PROMOTING`. |
+| `SUCCEEDED` | Final 100% target traffic was verified and the final-stage health evaluation passed at the current revision. `trafficSafety` is `EXPOSED`. | Read/emit status and terminal event. | None. | Terminal. |
+| `CANARY_FAILED` | A required health condition failed, or a post-exposure operation failed, after target traffic may have been exposed. | Persist reason; prohibit further promotion; record rollback intent before rollback writes. | `ROLLING_BACK`. | Rollback begins. This state does not skip to terminal `FAILED`. |
+| `ROLLING_BACK` | Rollback action is underway. | Idempotently set target to 0% and previous healthy version to 100%; observe result; retry/reconcile. | `ROLLED_BACK`, `FAILED`. | Restored traffic is verified (`ROLLED_BACK`) or the rollback policy is exhausted (`FAILED`). |
+| `ROLLED_BACK` | Previous version has verified 100% traffic and target has 0%. `trafficSafety` is `VERIFIED_STABLE`. | Read/emit terminal status and rollback details. | None. | Terminal. Rollback is not complete until this verification exists. |
+| `FAILED` | A never-exposed deployment failed, or rollback could not complete within policy. | Preserve failure/rollback detail and `trafficSafety`; expose status for operator diagnosis. | None. | Terminal in this lifecycle; any later retry is a new request/deployment. `FAILED` does not mean traffic is safe. |
 
-Legal transitions are exactly those in the state table/diagram; each is a conditional PostgreSQL transition from its stated expected state and revision. `PROMOTING` may only enter `VALIDATING` after the stage traffic is verified. `SUCCEEDED` is reachable only from final-stage `VALIDATING` after a fresh PASS for the current revision and verified 100%. `CANARY_FAILED` only enters `ROLLING_BACK` or, if rollback cannot complete under configured policy, `FAILED`. `ROLLING_BACK` can only enter `ROLLED_BACK` after restored traffic verification or `FAILED` after the configured failure policy is exhausted. `FAILED`, `SUCCEEDED`, and `ROLLED_BACK` are terminal; recovery/new desired work requires a new deployment request. Invalid transitions include `SUCCEEDED → rollback`, `ROLLED_BACK → promotion`, `CANARY_FAILED → promotion`, `ROLLING_BACK → promotion`, and any mutation/transition from a stale revision. Stale health results cannot authorize promotion.
+Legal transitions are exactly those in the state table/diagram; each is a conditional PostgreSQL transition from its stated expected state and revision. There is no `PROMOTING → SUCCEEDED`. There is no `CANARY → FAILED`, `VALIDATING → FAILED`, or `PROMOTING → FAILED`. After target traffic may have been exposed, a permanent failure enters `CANARY_FAILED` and then `ROLLING_BACK`; only exhausted rollback may enter `FAILED`. `DEPLOYING → FAILED` is allowed only with authoritative evidence that target traffic was never exposed. `CANARY_FAILED` enters only `ROLLING_BACK`. `PROMOTING` may enter `VALIDATING` only after the next stage traffic is verified. `SUCCEEDED` is reachable only from final-stage `VALIDATING` after verified 100% target traffic and a fresh PASS for the current revision. `ROLLING_BACK` may enter `ROLLED_BACK` only after verified stable 100% / target 0%, or `FAILED` after the configured rollback policy is exhausted. `FAILED`, `SUCCEEDED`, and `ROLLED_BACK` are terminal; recovery or new desired work requires a new deployment request. Invalid transitions include `SUCCEEDED → rollback`, `ROLLED_BACK → promotion`, `CANARY_FAILED → promotion`, `ROLLING_BACK → promotion`, `CANARY_FAILED → FAILED`, and any mutation/transition from a stale revision. Stale health results cannot authorize promotion.
+
+`trafficSafety` is persisted independently of lifecycle status as `NOT_EXPOSED`, `EXPOSED`, `UNKNOWN`, or `VERIFIED_STABLE`, together with the last authoritative observation and time. `SUCCEEDED` requires `EXPOSED` (the success guards already require verified 100% target traffic; `EXPOSED` means the latest fresh observation shows target weight above zero). `ROLLED_BACK` requires `VERIFIED_STABLE`. `FAILED` may retain `NOT_EXPOSED`, `EXPOSED`, or `UNKNOWN` according to the last fresh observation; it must not be presented as restored stable traffic. If rollback verification observes stable 100% / target 0%, the lifecycle transition is `ROLLED_BACK`, not `FAILED`.
 
 ## 9. PostgreSQL Responsibility and Conceptual Data Model
 

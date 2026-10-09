@@ -1,1 +1,32 @@
-{"name":"deployment-control-plane-controller","version":"0.1.0","private":true,"description":"Cloud-native deployment control plane API foundation","main":"dist/src/server.js","scripts":{"dev":"tsx watch src/server.ts","start":"node dist/src/server.js","build":"prisma generate && tsc -p tsconfig.json","typecheck":"tsc --noEmit -p tsconfig.json","test":"tsx --test tests/*.test.ts","db:check":"tsx src/db/check-connection.ts","prisma:generate":"prisma generate"},"dependencies":{"@prisma/client":"6.16.2","express":"5.1.0"},"devDependencies":{"@types/express":"5.0.3","@types/node":"22.15.30","@types/supertest":"6.0.3","prisma":"6.16.2","supertest":"7.1.4","tsx":"4.20.3","typescript":"5.8.3"}}
+{
+  "name": "deployment-control-plane-controller",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloud-native deployment control plane API foundation",
+  "main": "dist/src/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/src/server.js",
+    "build": "node node_modules/prisma/build/index.js generate && node node_modules/typescript/bin/tsc -p tsconfig.json",
+    "typecheck": "node node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
+    "test": "node node_modules/tsx/dist/cli.mjs --test tests/*.test.ts",
+    "db:check": "node node_modules/tsx/dist/cli.mjs src/db/check-connection.ts",
+    "db:generate": "node node_modules/prisma/build/index.js generate",
+    "db:validate": "node node_modules/prisma/build/index.js validate",
+    "db:migrate": "node node_modules/prisma/build/index.js migrate deploy",
+    "db:migrate:dev": "node node_modules/prisma/build/index.js migrate dev"
+  },
+  "dependencies": {
+    "@prisma/client": "6.16.2",
+    "express": "5.1.0"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.3",
+    "@types/node": "22.15.30",
+    "@types/supertest": "6.0.3",
+    "prisma": "6.16.2",
+    "supertest": "7.1.4",
+    "tsx": "4.20.3",
+    "typescript": "5.8.3"
+  }
+}
