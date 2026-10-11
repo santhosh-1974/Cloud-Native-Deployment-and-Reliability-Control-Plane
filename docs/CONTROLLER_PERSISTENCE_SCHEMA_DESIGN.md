@@ -1,483 +1,242 @@
 # Controller Persistence Schema Design
 
-**Status:** Draft for review  
-**Scope:** Phase 1, Step 5 — Schema design only. No implementation changes.  
+**Status:** Revised for review (Phase 1, Step 5)  
+**Scope:** Schema and persistence design only. No implementation code or migrations applied yet.  
 **Purpose:** Define the PostgreSQL schema required to support the controller state machine, safety invariants, and recovery protocol approved in `CONTROLLER_STATE_MACHINE_DESIGN.md` and `ARCHITECTURE.md`.
 
-## Repository state at the time of this design
+---
 
-The Prisma schema is located at `controller/prisma/schema.prisma`. It currently defines:
+## 1. Repository Baseline and Migration Context
 
-- **Models:** `Application`, `Deployment`, `DeploymentStage`, `HealthEvaluation`, `DeploymentEvent`
+The repository contains an existing baseline migration at:
+`controller/prisma/migrations/20261009135031_init/migration.sql`
+
+This tracked migration is the immutable baseline for this proposal. Its recovered
+SHA-256 is `05f0ff051e15df86b6991f4cd5a013f7e8c6d1c7d34556e486217e038fef9397`.
+Do not edit, replace, squash, or reapply it to the existing database. The
+proposed delta is a future second migration only and remains unapproved.
+
+This migration defines five core domain tables and four enums:
 - **Enums:** `DeploymentStatus`, `StageStatus`, `EvaluationResult`, `DeploymentEventType`
-- **Migration history:** One migration — `20261009135031_init` — which creates all five tables from scratch with their existing columns, constraints, and indexes.
+- **Tables:** `applications`, `deployments`, `deployment_stages`, `health_evaluations`, `deployment_events`
 
-No second migration exists. No production data exists. This is a **greenfield persistence implementation**: the baseline tables exist in code only, not in a running database.
+### 1.1 Baseline DDL Summary (from `20261009135031_init`)
 
-This fact eliminates any concern about backward compatibility with pre-existing rows. The design below describes the **complete initial persistence schema** (baseline plus all additions) and the **single additional migration** that extends the baseline schema to include the controller-required tables and columns.
-
-## 1. Design principles
-
-- **PostgreSQL is the source of truth:** All authoritative deployment state, ownership, fencing, and safety information resides in PostgreSQL. Kubernetes and ALB observations are persisted as evidence but are not the durable source of truth.
-- **No Redis:** All coordination, serialization, and fencing is PostgreSQL-backed.
-- **Atomic transitions:** Lifecycle transitions, stage state changes, and health result acceptance use conditional updates on expected state and revision.
-- **Crash-safe recovery:** All critical operations (intent, acknowledgment, health result, epoch change) are persisted before external side effects. Recovery reads durable state and re-observes external systems.
-- **Epoch fencing:** The coordinator epoch is monotonic and persisted in a singleton row. Health attempts record the epoch at creation. Abandonment targets attempts with epoch less than the current epoch.
-- **No invented configuration values:** Lease duration, renewal interval, mutation timeouts, and health window durations are required configuration values defined at deployment time, not in the schema.
-
-## 2. Baseline schema (existing — `20261009135031_init`)
-
-The following tables and columns exist from the initial migration. They are not changed by the new migration described in Section 5; they are the foundation upon which the new columns and tables are added.
-
-| Table | Key columns | Key indexes |
-|-------|------------|-------------|
-| `applications` | `id`, `name` (unique), `config`, timestamps | `applications_name_key` |
-| `deployments` | `id`, `application_id` (FK), `request_identity` (unique), `target_image`, `stable_image`, `desired_replicas`, `port`, `strategy`, `status`, `current_stage_index`, `revision`, `rollback_reason`, `rollback_outcome`, timestamps | `idx_deployments_by_app_status`, `idx_deployments_by_app` |
-| `deployment_stages` | `id`, `deployment_id` (FK), `stage_index`, `desired_canary_pct`, `desired_stable_pct`, `applied_canary_pct`, `applied_stable_pct`, `observed_canary_pct`, `observed_stable_pct`, `status`, `operation_id`, `operation_revision`, `apply_attempt`, `validation_started_at`, `validation_ended_at`, `completed_at`, `failure_reason`, timestamps | `idx_stages_by_deployment`, `uq_stage_per_deployment` |
-| `health_evaluations` | `id`, `deployment_id` (FK), `stage_id` (FK), `deployment_revision`, `window_start`, `window_end`, `result`, `is_fresh`, `failure_reason`, `observations`, timestamps | `idx_health_evals_by_stage`, `idx_health_evals_by_revision` |
-| `deployment_events` | `id`, `deployment_id` (FK), `event_type`, `payload`, `occurred_at` | `idx_events_by_deployment`, `idx_events_by_type` |
-
-**Enums defined in the baseline:**
-- `DeploymentStatus`: `PENDING`, `DEPLOYING`, `CANARY`, `VALIDATING`, `PROMOTING`, `SUCCEEDED`, `CANARY_FAILED`, `ROLLING_BACK`, `ROLLED_BACK`, `FAILED`
-- `StageStatus`: `UNEVALUATED`, `INTENT_RECORDED`, `APPLYING`, `APPLIED`, `VALIDATING`, `PASSED`, `FAILED`
-- `EvaluationResult`: `PASS`, `FAIL`, `INDETERMINATE`
-- `DeploymentEventType`: `DEPLOYMENT_CREATED`, `DEPLOYMENT_STARTED`, `STAGE_INTENT_RECORDED`, `TRAFFIC_APPLY_STARTED`, `TRAFFIC_APPLIED`, `TRAFFIC_VERIFIED`, `HEALTH_VALIDATION_STARTED`, `HEALTH_VALIDATION_PASSED`, `HEALTH_VALIDATION_FAILED`, `PROMOTION_STARTED`, `ROLLBACK_STARTED`, `ROLLBACK_VERIFIED`, `DEPLOYMENT_SUCCEEDED`, `DEPLOYMENT_FAILED`, `DEPLOYMENT_ROLLED_BACK`
-
-## 3. New schema additions
-
-### 3.1 Coordinator — Singleton ownership record
-
-**Purpose:** Serialize controller ownership, track the fencing epoch, and enforce lease-based safety for Kubernetes mutations.
-
-**Schema gap:** The baseline schema has no coordinator row. The state machine design requires a singleton PostgreSQL row with owner ID, epoch, lease expiry, and renewal timestamp.
-
-**New table:** `coordinator`
-
-| Column | Type | Constraints | Purpose |
-|--------|------|-------------|---------|
-| `id` | `TEXT` | PRIMARY KEY, value `'singleton'` | Single-row table identifier |
-| `owner_id` | `TEXT` | NULLABLE | Identifier of the current coordinator owner (e.g., process ID, host). NULL indicates no current owner. |
-| `epoch` | `INTEGER` | NOT NULL, monotonic increment on acquisition | Fencing epoch; each new owner increments this value |
-| `lease_expires_at` | `TIMESTAMP(3)` | NOT NULL | When the current lease expires (database time) |
-| `renewed_at` | `TIMESTAMP(3)` | NOT NULL | Last successful lease renewal timestamp |
-| `created_at` | `TIMESTAMP(3)` | NOT NULL, DEFAULT `now()` | Row creation timestamp |
-| `updated_at` | `TIMESTAMP(3)` | NOT NULL, DEFAULT `now()` | Last update timestamp |
-
-**Indexes:**
-- Primary key on `id` (singleton row)
-- No additional indexes needed (single-row table)
-
-**Constraints:**
-- Only one row exists (`id = 'singleton'`)
-- `epoch` must increase on every ownership transfer
-- `lease_expires_at` must be > current database time for valid ownership
-- Acquisition locks the row and succeeds only when no live lease exists
-
-**Transaction semantics:**
-- **Seed row (inserted by migration):** `id = 'singleton'`, `owner_id = NULL` (no current owner), `epoch = 0`, `lease_expires_at = '1970-01-01'` (expired, so the first process can immediately acquire), `renewed_at = now()`. This row is created by the migration and must exist before any coordinator process starts.
-- **Acquisition:** `SELECT FOR UPDATE` on the singleton row, verify `lease_expires_at < now()` using database time, increment `epoch`, set new `owner_id`, set new `lease_expires_at` (database time + configured lease duration), and set `renewed_at = now()`. The epoch must increment monotonically on every ownership transfer.
-- **Renewal:** Conditional `UPDATE` where `owner_id` matches the current owner, `epoch` matches the current epoch, and `lease_expires_at > now()`. Update `lease_expires_at` (database time + configured lease duration) and `renewed_at = now()`.
-- **Lease check:** Before any Kubernetes mutation, compute `remaining_lease = lease_expires_at - now()` using database time. Start mutation only if `remaining_lease > configured_mutation_timeout`. If not, renew the lease first and re-check.
-
-**Open design decision:** The exact format of `owner_id` (process ID, UUID, host-based identifier) is not specified here. It must be unique enough to distinguish different coordinator instances.
-
-### 3.2 Health evaluations — Enhanced attempt tracking
-
-**Purpose:** Track health evaluation attempts with attempt identity, coordinator epoch, completion status, abandonment reason, and target version snapshot to support crash-safe recovery and epoch-based abandonment.
-
-**Schema gap:** The baseline `health_evaluations` table lacks: explicit attempt ID, completion status (`RUNNING`, `COMPLETE`, `INCOMPLETE`), coordinator epoch, abandonment reason, and a `target_image` snapshot. Because this is a greenfield implementation with no existing rows, these columns are added as `NOT NULL` where semantically required — no staged backfill is necessary.
-
-**New columns on `health_evaluations`:**
-
-| Column | Type | Constraints | Purpose |
-|--------|------|-------------|---------|
-| `attempt_id` | `TEXT` (UUID) | NOT NULL | Unique identity for this evaluation attempt |
-| `coordinator_epoch` | `INTEGER` | NOT NULL | The coordinator epoch when this attempt was created |
-| `completion` | `TEXT` (ENUM) | NOT NULL, values: `RUNNING`, `COMPLETE`, `INCOMPLETE` | Attempt completion status (orthogonal to result) |
-| `completed_at` | `TIMESTAMP(3)` | NULLABLE | When the attempt was completed or abandoned |
-| `abandonment_reason` | `TEXT` | NULLABLE | Reason for abandonment (e.g., "epoch_change", "process_crash", "revision_change") |
-| `target_image` | `TEXT` | NOT NULL | Snapshot of the target image at attempt creation |
-
-**Note:** The existing baseline columns (`window_start`, `window_end`, `result`, `is_fresh`, `failure_reason`, `observations`) are retained unchanged.
-
-**Open design decision — `result` nullability:** The baseline schema declares `result EvaluationResult NOT NULL`. With the new `completion` column, a `RUNNING` attempt has not yet produced a result. Two resolution options exist:
-
-1. **Make `result` nullable** in the new migration: `result` is `NULL` while the attempt is `RUNNING`, and set to `PASS`, `FAIL`, or `INDETERMINATE` when `completion` transitions to `COMPLETE`. This is semantically precise but requires an `ALTER COLUMN` on the existing baseline column.
-2. **Keep `result` NOT NULL with a sentinel value**: Insert `INDETERMINATE` as the initial value for `RUNNING` attempts, and update it when the result arrives. This avoids an `ALTER COLUMN` but makes `INDETERMINATE` ambiguous (it can mean "still running" or "genuinely indeterminate result").
-
-**This decision must be resolved before implementation.** The preferred resolution is option 1 (make `result` nullable) because it is semantically precise and avoids ambiguity. If approved, the migration must `ALTER COLUMN result DROP NOT NULL` on `health_evaluations`.
-
-**Open design decision — health-observation structure:** The baseline `observations` column is a `JSONB` field with a flexible schema. The controller's result-acceptance logic reads individual signal values from this field. The exact shape of the observations object (field names, units, required vs. optional signals) must be defined before implementation. The schema does not enforce the shape; the application layer is responsible for validation.
-
-**New indexes:**
-- Unique index on `(deployment_id, stage_id, attempt_id)` to ensure one attempt ID per stage per deployment (canonical attempt-identity constraint)
-- Index on `(coordinator_epoch, completion)` for efficient epoch-based abandonment queries
-- Index on `(deployment_id, stage_id, coordinator_epoch, completion)` for targeted abandonment
-
-**Transaction semantics:**
-- **Attempt creation:** Insert with `attempt_id` (new UUID), `coordinator_epoch` (current epoch from coordinator row), `completion = 'RUNNING'`, `completed_at = NULL`, `target_image` snapshot.
-- **Abandonment (epoch change):** Conditional `UPDATE` where `completion = 'RUNNING'` AND `coordinator_epoch < new_epoch`. Set `completion = 'INCOMPLETE'`, `completed_at = now()`, `abandonment_reason = 'epoch_change'`. Do not abandon attempts with `coordinator_epoch >= new_epoch`.
-- **Abandonment (same-epoch crash):** If the coordinator process itself performs health evaluation, it may abandon its own `RUNNING` attempts on restart using the same conditional update. If separate worker processes perform health evaluation, abandonment requires a defined durable worker identity and liveness mechanism (open design decision per Section 9.1 of state machine design).
-- **Result acceptance:** Conditional `UPDATE` where `attempt_id` matches, `completion = 'RUNNING'`, `deployment_revision` matches, `stage_id` matches, `coordinator_epoch` matches the current coordinator epoch (from the coordinator row), and deployment lifecycle is `VALIDATING`. If the attempt was marked `INCOMPLETE`, the revision changed, the epoch changed, or the lifecycle is no longer `VALIDATING`, the result is rejected. The `completion` status is orthogonal to the `result` (`PASS`, `FAIL`, `INDETERMINATE`); a result can only be recorded on a `COMPLETE` attempt, and `PASS` is only allowed on `COMPLETE` when the full interval and all required signals are available and fresh.
-
-**Concurrency and serialization:** Concurrent result submission and abandonment are serialized by the conditional `UPDATE` guard. Only one transaction can successfully transition `completion` from `RUNNING` to `COMPLETE` or `INCOMPLETE`. The first transaction to succeed commits; subsequent attempts fail the conditional guard and must reload state.
-
-**Safety guarantee:** Late results from abandoned attempts cannot authorize promotion because the conditional write guard checks `completion = 'RUNNING'`, matching `attempt_id`, `deployment_revision`, `coordinator_epoch` (against the coordinator row), and lifecycle `VALIDATING`. Even if a stale worker from a previous epoch is still running and submits a result, the result is rejected because the attempt is marked `INCOMPLETE` or the epoch no longer matches the current coordinator epoch.
-
-### 3.3 Traffic safety — Observation tracking
-
-**Purpose:** Persist traffic safety state and observation history to distinguish between desired, applied, and verified traffic, and to support crash-safe recovery.
-
-**Schema gap:** The baseline `deployments` table has no `traffic_safety` field. The baseline `deployment_stages` table has `desiredCanaryPct`, `appliedCanaryPct`, `observedCanaryPct` but no separate traffic safety enumeration and no observation timestamp or freshness tracking. No traffic observation history table exists.
-
-**New columns on `deployments`:**
-
-| Column | Type | Constraints | Purpose |
-|--------|------|-------------|---------|
-| `traffic_safety` | `TEXT` (ENUM) | NOT NULL, values: `NOT_EXPOSED`, `EXPOSED`, `UNKNOWN`, `VERIFIED_STABLE` | Current traffic safety state |
-| `traffic_observed_at` | `TIMESTAMP(3)` | NULLABLE | Timestamp of the last authoritative traffic observation |
-| `traffic_observation_source` | `TEXT` | NULLABLE | Source of the observation (e.g., "alb_describe_rules") |
-
-**Default for new rows:** `traffic_safety = 'UNKNOWN'`. This is the conservative initial value; the controller updates it after observing actual traffic state.
-
-**New table:** `traffic_observations`
-
-| Column | Type | Constraints | Purpose |
-|--------|------|-------------|---------|
-| `id` | `TEXT` (UUID) | PRIMARY KEY | Observation record identifier |
-| `deployment_id` | `TEXT` | NOT NULL, FK to `deployments` | Associated deployment |
-| `stage_id` | `TEXT` | NULLABLE, FK to `deployment_stages` | Associated stage (if observation is stage-specific) |
-| `deployment_revision` | `INTEGER` | NOT NULL | Deployment revision at observation time |
-| `coordinator_epoch` | `INTEGER` | NOT NULL | Coordinator epoch at observation time |
-| `observation_type` | `TEXT` (ENUM) | NOT NULL, values: `DESIRED`, `APPLIED`, `OBSERVED` | Type of traffic observation |
-| `stable_weight_pct` | `INTEGER` | NOT NULL | Stable traffic percentage (0-100) |
-| `target_weight_pct` | `INTEGER` | NOT NULL | Target traffic percentage (0-100) |
-| `ingress_uid` | `TEXT` | NULLABLE | Kubernetes Ingress UID (for applied observations) |
-| `ingress_resource_version` | `TEXT` | NULLABLE | Kubernetes Ingress resourceVersion (for applied observations) |
-| `ingress_generation` | `INTEGER` | NULLABLE | Kubernetes Ingress generation (for applied observations) |
-| `listener_rule_arn` | `TEXT` | NULLABLE | AWS ELBv2 listener rule ARN (for observed observations) |
-| `target_group_arns` | `JSONB` | NULLABLE | Array of target group ARNs and weights observed in ALB |
-| `is_fresh` | `BOOLEAN` | NOT NULL, DEFAULT `true` | Whether this observation is still fresh |
-| `observed_at` | `TIMESTAMP(3)` | NOT NULL | When this observation was made |
-| `created_at` | `TIMESTAMP(3)` | NOT NULL, DEFAULT `now()` | Record creation timestamp |
-
-**Indexes:**
-- Primary key on `id`
-- Index on `(deployment_id, stage_id, observed_at DESC)` for latest observation per stage
-- Index on `(deployment_id, deployment_revision, observation_type)` for revision-specific observation queries
-- Index on `(coordinator_epoch, observation_type)` for epoch-based cleanup
-
-**Transaction semantics:**
-- **Record desired traffic:** Insert `DESIRED` observation when stage intent is persisted.
-- **Record applied traffic:** Insert `APPLIED` observation after Kubernetes Ingress write is acknowledged, with `ingress_uid`, `ingress_resource_version`, `ingress_generation`.
-- **Record observed traffic:** Insert `OBSERVED` observation after authoritative ALB `DescribeRules` read, with `listener_rule_arn`, `target_group_arns`, and verified weights. The approved state machine design requires two ALB observations separated by a Kubernetes identity check: first ALB read to verify applied configuration, then a second ALB read after a configured stabilization interval to confirm the rule is stable.
-- **Update `traffic_safety`:** After each authoritative observation, conditionally update `deployments.traffic_safety` based on the observation type and weights:
-  - `NOT_EXPOSED`: Only before any nonzero target write, with verified zero target weight.
-  - `EXPOSED`: When latest fresh observation shows target weight > 0 (including verified 100% target for success).
-  - `VERIFIED_STABLE`: Only for `ROLLED_BACK` with fresh stable 100% / target 0% observation.
-  - `UNKNOWN`: When traffic cannot be determined (observation unavailable, ambiguous, or stale).
-- **Freshness tracking:** Mark `is_fresh = false` when a newer observation supersedes an old one, or when a configured freshness bound expires.
-
-**Distinction between traffic states:**
-- **Desired traffic intent:** PostgreSQL stage intent (stable/target weights) representing what the controller wants.
-- **Applied Kubernetes configuration:** Kubernetes Ingress resource accepted at its new resourceVersion/generation, plus AWS Load Balancer Controller reconciliation status. This proves configuration was accepted by Kubernetes, not that the ALB is using it.
-- **Observed ALB listener-rule configuration:** A fresh AWS Elastic Load Balancing v2 `DescribeRules` read of the listener rule mapped to the managed Ingress host/path and stable/target target-group ARNs. The forward action's target groups and configured weights must exactly match the desired stage. This verifies configured routing weights, not exact proportions of live requests.
-- **`trafficSafety`:** A separate field on deployments summarizing the latest fresh observation's safety classification. It is not derived from lifecycle status alone.
-
-**Safety guarantee:** `SUCCEEDED` requires `traffic_safety = 'EXPOSED'` with a fresh observation showing verified 100% target traffic and a fresh passing health evaluation at the final stage. `ROLLED_BACK` requires `traffic_safety = 'VERIFIED_STABLE'` with a fresh observation showing stable 100% / target 0% traffic. `FAILED` may retain `NOT_EXPOSED`, `EXPOSED`, or `UNKNOWN` but must not be presented as restored stable traffic. Unknown or stale observations cannot authorize promotion or rollback completion. Configured ALB weights do not prove exact live request proportions; they only prove the routing configuration.
-
-### 3.4 Kubernetes/ALB observations — Detailed resource tracking
-
-**Purpose:** Persist detailed Kubernetes resource state and ALB observations to support fencing, recovery, and verification of applied vs. observed state.
-
-**Schema gap:** The baseline `deployment_stages` table has `appliedCanaryPct`, `appliedStablePct`, `observedCanaryPct`, `observedStablePct` but lacks the detailed Kubernetes and ALB metadata required for fencing (resourceVersion, generation, UID, listener rule ARN, target group ARNs).
-
-**New columns on `deployment_stages`:**
-
-| Column | Type | Constraints | Purpose |
-|--------|------|-------------|---------|
-| `ingress_uid` | `TEXT` | NULLABLE | Kubernetes Ingress UID (for fencing) |
-| `ingress_resource_version` | `TEXT` | NULLABLE | Kubernetes Ingress resourceVersion (for fencing) |
-| `ingress_generation` | `INTEGER` | NULLABLE | Kubernetes Ingress generation (for fencing) |
-| `listener_rule_arn` | `TEXT` | NULLABLE | AWS ELBv2 listener rule ARN (for verification) |
-| `stable_target_group_arn` | `TEXT` | NULLABLE | ARN of the stable target group |
-| `target_target_group_arn` | `TEXT` | NULLABLE | ARN of the target (canary) target group |
-| `last_observed_at` | `TIMESTAMP(3)` | NULLABLE | Timestamp of the last authoritative ALB observation |
-
-**Indexes (new):**
-- Index on `(ingress_uid, ingress_resource_version)` for fencing conflict detection
-- Index on `(listener_rule_arn)` for rule-to-deployment mapping
-
-**Transaction semantics:**
-- **Fencing write:** Before Kubernetes mutation, capture `ingress_uid` and `ingress_resource_version`. After the write, persist these values in the stage record along with the applied weights.
-- **Verification:** After ALB `DescribeRules`, persist `listener_rule_arn`, target group ARNs, and observed weights. Update `last_observed_at`.
-- **Fencing conflict:** If a concurrent write changes `ingress_resource_version`, the old worker's conditional update fails and must reload/reconcile.
-
-**Safety guarantee:** Kubernetes mutations use the exact observed `resourceVersion` as a compare-and-swap precondition. If the resourceVersion has changed, the mutation is rejected and the worker must reload state and re-validate ownership.
-
-## 4. Complete schema at implementation
-
-After the initial migration (`20261009135031_init`) and the new migration described in Section 5, the complete schema will include the following tables and models:
-
-| Table | Status | Models / additions |
-|-------|--------|--------------------|
-| `applications` | Baseline (unchanged) | `Application` model |
-| `deployments` | Baseline + new columns | `traffic_safety`, `traffic_observed_at`, `traffic_observation_source` |
-| `deployment_stages` | Baseline + new columns | `ingress_uid`, `ingress_resource_version`, `ingress_generation`, `listener_rule_arn`, `stable_target_group_arn`, `target_target_group_arn`, `last_observed_at` |
-| `health_evaluations` | Baseline + new columns | `attempt_id`, `coordinator_epoch`, `completion`, `completed_at`, `abandonment_reason`, `target_image`; possible `result` nullability change (see Section 3.2) |
-| `deployment_events` | Baseline (unchanged) | `DeploymentEvent` model |
-| `coordinator` | New | Full `Coordinator` model |
-| `traffic_observations` | New | Full `TrafficObservation` model |
-
-## 5. Concurrency and transactions
-
-### 5.1 Conditional updates for lifecycle transitions
-
-**Pattern:** All lifecycle transitions use conditional `UPDATE` statements that check expected state and revision.
-
-**Example for `DEPLOYING → CANARY`:**
 ```sql
-UPDATE deployments
-SET status = 'CANARY',
-    revision = revision + 1,
-    updated_at = now()
-WHERE id = $deployment_id
-  AND status = 'DEPLOYING'
-  AND revision = $expected_revision;
-```
-
-If the update affects 0 rows, the transition is rejected (stale revision or unexpected state). The worker must reload state and re-validate ownership.
-
-### 5.2 Atomic event recording
-
-**Pattern:** Lifecycle transitions append an event in the same transaction as the state change.
-
-**Example:**
-```sql
-BEGIN;
--- Update deployment status and revision
-UPDATE deployments SET ... WHERE ...;
--- Append event
-INSERT INTO deployment_events (deployment_id, event_type, payload, occurred_at)
-VALUES ($deployment_id, 'DEPLOYMENT_STARTED', $payload, now());
-COMMIT;
-```
-
-The event record is durable evidence of the transition and survives crashes.
-
-### 5.3 Stale-result rejection
-
-**Pattern:** Health result acceptance must be serialized against coordinator takeover and deployment lifecycle transitions. The transaction locks the coordinator row to prevent ownership transfer between the epoch read and the health result write. Lease validity must still be checked even with the row lock. The result update is atomic: it updates result, completion, completed_at, and associated metadata in one conditional operation.
-
-**Example:**
-```sql
-BEGIN;
--- Lock the coordinator row to serialize against takeover
-SELECT epoch, owner_id, lease_expires_at INTO current_epoch, current_owner, current_lease_expiry
-FROM coordinator
-WHERE id = 'singleton'
-FOR UPDATE;
-
-
--- Verify lease is still valid (holding the lock does not guarantee lease validity)
-IF current_lease_expiry <= now() THEN
-    ROLLBACK;
-END IF;
-
--- Verify current owner identity matches the worker's coordinator identity
-IF current_owner != $worker_coordinator_identity THEN
-    ROLLBACK;
-END IF;
-
--- Verify current epoch matches the attempt epoch and worker epoch
-IF current_epoch != $attempt_epoch OR current_epoch != $worker_epoch THEN
-    ROLLBACK;
-END IF;
-
--- Conditionally update the health evaluation with atomic completion and result
-UPDATE health_evaluations
-SET result = $result,
-    completion = 'COMPLETE',
-    completed_at = now(),
-    failure_reason = $failure_reason,
-    observations = $observations,
-    is_fresh = true,
-    updated_at = now()
-WHERE id = $evaluation_id
-  AND attempt_id = $attempt_id
-  AND completion = 'RUNNING'
-  AND deployment_revision = $expected_revision
-  AND stage_id = $stage_id
-  AND deployment_id = $deployment_id
-  AND coordinator_epoch = current_epoch;
-
--- Verify the deployment is still in VALIDATING lifecycle and revision unchanged
-SELECT status, revision INTO current_status, current_revision FROM deployments WHERE id = $deployment_id;
-IF current_status != 'VALIDATING' OR current_revision != $expected_revision THEN
-    ROLLBACK;
-END IF;
-
-COMMIT;
-```
-
-**Protocol rationale:**
-- The `SELECT FOR UPDATE` on the coordinator row acquires a lock that conflicts with the coordinator takeover transaction (which also locks the row with `SELECT FOR UPDATE` before incrementing the epoch). Coordinator takeover and lease renewal follow consistent row-locking and conditional-update rules (Section 3.1).
-- The lease validity check ensures the coordinator's lease is still valid even though the row is locked. Holding the lock does not automatically mean the lease is valid. The lease can expire during the transaction if the transaction runs longer than the remaining lease time; the check prevents accepting a result after the lease has expired.
-- The owner identity check ensures the current owner matches the worker's coordinator identity. If ownership transferred, the new owner's identity will not match the old worker's identity.
-- The epoch check ensures the current epoch matches both the attempt epoch (when the attempt was created) and the worker epoch (the epoch the worker believes it owns). If the epoch changed, the result is rejected.
-- The conditional UPDATE atomically transitions `completion` from `RUNNING` to `COMPLETE` and sets the result, `completed_at`, and metadata in one operation. This prevents a race where one transaction sets the result while another sets completion to `INCOMPLETE`.
-- The deployment lifecycle and revision check ensures the deployment is still in `VALIDATING` state and the revision has not changed. If a lifecycle transition (e.g., to `CANARY_FAILED` or `PROMOTING`) occurred during the result transaction, the check fails and the result is rejected.
-- If a coordinator takeover attempts to acquire the lock while a health result transaction is in progress, the takeover will wait for the result transaction to complete (due to row lock conflict).
-- After the result transaction commits, the takeover can proceed. If the epoch changed during the result transaction, the coordinator row lock ensures the takeover sees the post-result state, and the result's conditional update guard (checking `coordinator_epoch`) will have rejected the result if the epoch no longer matches.
-- If the takeover acquired the lock first, the result transaction will wait. When it proceeds, it will read the new epoch, and the conditional update guard will reject the result because `coordinator_epoch` no longer matches.
-- If a lifecycle transition attempts to update the deployment status while a result transaction is in progress, the lifecycle transition uses a conditional UPDATE on the deployment revision (Section 5.1). The result transaction also checks the deployment revision. The first transaction to commit wins; the second transaction's conditional UPDATE will fail because the revision no longer matches, and it must reload state.
-- This protocol ensures that a health result from a previous coordinator epoch is never accepted after ownership has transferred, even if the old process is still running. It also ensures that a result is not accepted if the deployment lifecycle leaves `VALIDATING` or the revision changes before the result transaction commits.
-
-**Concurrency behavior for competing submissions and abandonment:**
-- **Competing result submissions:** Two workers attempting to submit results for the same attempt will both lock the coordinator row and attempt the conditional UPDATE. The first to succeed transitions `completion` to `COMPLETE` and commits. The second's conditional UPDATE fails because `completion` is no longer `RUNNING`. The second must reload state and cannot accept its result.
-- **Abandonment during result submission:** If an abandonment (epoch change or process crash) attempts to mark the attempt `INCOMPLETE` while a result transaction is in progress, the abandonment transaction also locks the coordinator row and attempts a conditional UPDATE on `completion`. The first transaction to succeed (result or abandonment) commits. If abandonment wins, the result's conditional UPDATE fails because `completion` is no longer `RUNNING`. If result wins, the abandonment's conditional UPDATE fails because `completion` is no longer `RUNNING`. The winner commits; the loser must reload state.
-- **Lifecycle transition during result submission:** If a lifecycle transition (e.g., to `CANARY_FAILED`) attempts to update the deployment while a result transaction is in progress, both transactions check the deployment revision. The first to commit wins; the second's conditional UPDATE fails because the revision no longer matches. The result acceptance transaction also explicitly checks the deployment status; if the status changed to non-`VALIDATING`, the result transaction rolls back.
-
-If the update affects 0 rows, the result is rejected (attempt abandoned, revision changed, epoch changed, stage mismatched, or lifecycle changed). The coordinator epoch check is against the authoritative coordinator row (read under lock), not a local cached value or a Kubernetes annotation. Kubernetes does not enforce the epoch annotation; this is application-layer fencing.
-
-### 5.4 Recovery after crashes
-
-**Pattern:** On startup, the controller:
-1. Acquires or renews coordinator ownership (Section 3.1).
-2. If epoch changed, abandons `RUNNING` health attempts with `coordinator_epoch < new_epoch` (Section 3.2).
-
-3. Reloads all non-terminal deployments.
-4. Re-observes Kubernetes and ALB state.
-5. Reconciles durable intent with actual state using conditional updates.
-
-**Key invariant:** No in-memory state is authoritative. All decisions are based on durable PostgreSQL state plus fresh external observations.
-
-## 6. Constraints and indexes
-
-### 6.1 Primary keys
-
-- `coordinator.id` — Singleton row (`'singleton'`)
-- `applications.id` — UUID
-- `deployments.id` — UUID
-- `deployment_stages.id` — UUID
-- `health_evaluations.id` — UUID
-- `deployment_events.id` — UUID
-- `traffic_observations.id` — UUID
-
-### 6.2 Foreign keys
-
-- `deployments.application_id` → `applications.id`
-- `deployment_stages.deployment_id` → `deployments.id`
-- `health_evaluations.deployment_id` → `deployments.id`
-- `health_evaluations.stage_id` → `deployment_stages.id`
-- `deployment_events.deployment_id` → `deployments.id`
-- `traffic_observations.deployment_id` → `deployments.id`
-- `traffic_observations.stage_id` → `deployment_stages.id` (nullable)
-
-All foreign keys use `ON DELETE RESTRICT` to prevent accidental deletion of referenced records.
-
-### 6.3 Uniqueness constraints
-
-- `applications.name` — Unique application identifier
-- `deployments.request_identity` — Idempotency key for deployment requests
-- `deployment_stages.(deployment_id, stage_index)` — One stage per index per deployment
-- `health_evaluations.(deployment_id, stage_id, attempt_id)` — One attempt ID per stage per deployment
-
-### 6.4 Indexes for performance
-
-**Baseline indexes (retained unchanged):**
-- `idx_deployments_by_app_status` on `(application_id, status)`
-- `idx_deployments_by_app` on `(application_id, created_at DESC)`
-- `idx_stages_by_deployment` on `(deployment_id, stage_index)`
-- `idx_health_evals_by_stage` on `(deployment_id, stage_id, created_at DESC)`
-- `idx_health_evals_by_revision` on `(deployment_id, deployment_revision)`
-- `idx_events_by_deployment` on `(deployment_id, occurred_at)`
-- `idx_events_by_type` on `(event_type, occurred_at DESC)`
-
-**New indexes required:**
-- `uq_health_evals_attempt` unique index on `(deployment_id, stage_id, attempt_id)` — Canonical attempt-identity constraint
-- `idx_health_evals_by_epoch_completion` on `(coordinator_epoch, completion)` — For epoch-based abandonment
-- `idx_health_evals_by_deployment_stage_epoch` on `(deployment_id, stage_id, coordinator_epoch, completion)` — For targeted abandonment
-- `idx_traffic_observations_by_deployment_stage` on `(deployment_id, stage_id, observed_at DESC)` — Latest observation per stage
-- `idx_traffic_observations_by_deployment_revision` on `(deployment_id, deployment_revision, observation_type)` — Revision-specific queries
-- `idx_traffic_observations_by_epoch` on `(coordinator_epoch, observation_type)` — Epoch-based cleanup
-- `idx_stages_by_ingress` on `(ingress_uid, ingress_resource_version)` — Fencing conflict detection
-- `idx_stages_by_listener_rule` on `(listener_rule_arn)` — Rule-to-deployment mapping
-
-### 6.5 Nullability
-
-**Required (NOT NULL):**
-- All primary keys
-- All foreign keys
-- `deployments.status`, `deployments.revision`, `deployments.traffic_safety`
-- `deployment_stages.stage_index`, `deployment_stages.status`
-- `health_evaluations.attempt_id`, `health_evaluations.coordinator_epoch`, `health_evaluations.completion`, `health_evaluations.target_image`
-- `coordinator.epoch`, `coordinator.lease_expires_at`, `coordinator.renewed_at`
-- `traffic_observations.observation_type`, `traffic_observations.stable_weight_pct`, `traffic_observations.target_weight_pct`, `traffic_observations.coordinator_epoch`, `traffic_observations.observed_at`
-
-**Nullable (allow NULL):**
-- `coordinator.owner_id` (NULL indicates no current owner; set to non-NULL on acquisition)
-- Optional metadata fields (`ingress_uid`, `listener_rule_arn`, etc.) when not yet observed
-- `health_evaluations.completed_at` (NULL while `RUNNING`)
-- `health_evaluations.abandonment_reason` (NULL if not abandoned)
-- `health_evaluations.result` (NULL while `RUNNING` — pending resolution of open design decision in Section 3.2)
-- `deployments.traffic_observed_at` (NULL if no observation yet)
-- `traffic_observations.stage_id` (NULL for deployment-level observations)
-
-### 6.6 Data types
-
-- **IDs:** `TEXT` (UUID or string identifiers)
-- **Enumerations:** `TEXT` with application-level validation (Prisma enums in implementation)
-- **Timestamps:** `TIMESTAMP(3)` (millisecond precision)
-- **Integers:** `INTEGER` (revision, percentages, counts)
-- **JSON:** `JSONB` for flexible structured data (observations, strategy, target_group_arns)
-- **Booleans:** `BOOLEAN`
-
-## 7. Migration plan
-
-### 7.1 Migration context
-
-**Baseline migration:** `20261009135031_init` — creates all five baseline tables from scratch. This migration is already part of the repository. It has not been applied to any running database.
-
-**New migration:** A single additional migration (to be named, e.g., `_controller_persistence`) extends the baseline schema with all additions described in Section 3. Because there is no production database and no existing rows, all new `NOT NULL` columns can be added directly without staged backfill.
-
-The new migration does not alter the baseline migration. It is a second, independent migration step that Prisma applies after the init migration.
-
-### 7.2 New migration — complete operations
-
-All operations below are part of a single new migration. Because the database is empty when applied, no data backfill is required.
-
-**1. Create the `coordinator` table and seed the singleton row:**
-```sql
-CREATE TABLE "public"."coordinator" (
-    "id"               TEXT         NOT NULL,
-    "owner_id"         TEXT,
-    "epoch"            INTEGER      NOT NULL,
-    "lease_expires_at" TIMESTAMP(3) NOT NULL,
-    "renewed_at"       TIMESTAMP(3) NOT NULL,
-    "created_at"       TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updated_at"       TIMESTAMP(3) NOT NULL,
-
-    CONSTRAINT "coordinator_pkey" PRIMARY KEY ("id")
+-- Existing Enums
+CREATE TYPE "public"."DeploymentStatus" AS ENUM (
+    'PENDING', 'DEPLOYING', 'CANARY', 'VALIDATING', 'PROMOTING',
+    'SUCCEEDED', 'CANARY_FAILED', 'ROLLING_BACK', 'ROLLED_BACK', 'FAILED'
+);
+CREATE TYPE "public"."StageStatus" AS ENUM (
+    'UNEVALUATED', 'INTENT_RECORDED', 'APPLYING', 'APPLIED',
+    'VALIDATING', 'PASSED', 'FAILED'
+);
+CREATE TYPE "public"."EvaluationResult" AS ENUM ('PASS', 'FAIL', 'INDETERMINATE');
+CREATE TYPE "public"."DeploymentEventType" AS ENUM (
+    'DEPLOYMENT_CREATED', 'DEPLOYMENT_STARTED', 'STAGE_INTENT_RECORDED',
+    'TRAFFIC_APPLY_STARTED', 'TRAFFIC_APPLIED', 'TRAFFIC_VERIFIED',
+    'HEALTH_VALIDATION_STARTED', 'HEALTH_VALIDATION_PASSED', 'HEALTH_VALIDATION_FAILED',
+    'PROMOTION_STARTED', 'ROLLBACK_STARTED', 'ROLLBACK_VERIFIED',
+    'DEPLOYMENT_SUCCEEDED', 'DEPLOYMENT_FAILED', 'DEPLOYMENT_ROLLED_BACK'
 );
 
--- Seed the singleton row. owner_id is NULL (no current owner).
--- lease_expires_at is set to the Unix epoch so the first process can immediately acquire.
-INSERT INTO "public"."coordinator" ("id", "owner_id", "epoch", "lease_expires_at", "renewed_at", "created_at", "updated_at")
-VALUES ('singleton', NULL, 0, '1970-01-01 00:00:00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+-- Existing Tables Summary
+-- applications: id (TEXT PK), name (TEXT UNIQUE), config (JSONB), created_at, updated_at
+-- deployments: id (TEXT PK), application_id (FK), request_identity (TEXT UNIQUE), target_image,
+--              stable_image, desired_replicas, port, strategy (JSONB), status (DeploymentStatus),
+--              current_stage_index, revision (INT DEFAULT 0), rollback_reason, rollback_outcome,
+--              created_at, updated_at, completed_at
+-- deployment_stages: id (TEXT PK), deployment_id (FK), stage_index, desired_canary_pct,
+--                    desired_stable_pct, applied_canary_pct, applied_stable_pct,
+--                    observed_canary_pct, observed_stable_pct, status (StageStatus),
+--                    operation_id, operation_revision, apply_attempt, validation_started_at,
+--                    validation_ended_at, completed_at, failure_reason, created_at, updated_at
+-- health_evaluations: id (TEXT PK), deployment_id (FK), stage_id (FK), deployment_revision,
+--                     window_start, window_end, result (EvaluationResult NOT NULL), is_fresh,
+--                     failure_reason, observations (JSONB), created_at, updated_at
+-- deployment_events: id (TEXT PK), deployment_id (FK), event_type (DeploymentEventType),
+--                    payload (JSONB), occurred_at
 ```
 
-**2. Add new columns to `deployments`:**
+### 1.2 Proposed Migration Boundary & Existing-Data Precondition
+
+- **Migration Directory:** Standard 14-digit Prisma timestamp format: `20261010120000_controller_persistence`.
+- **Comprehensive Existing-Data Precondition:**  
+  The migration adds columns (`attempt_id`, `coordinator_epoch`, `target_image`) as `NOT NULL` without defaults to preserve semantic integrity, and adds columns to `deployments` and `deployment_stages`.  
+  It must not invent synthetic history or fake attempt IDs for existing rows.  
+  Therefore, before applying `20261010120000_controller_persistence`, the migration verifies that **all affected baseline tables** are empty:
+  ```sql
+  DO $$
+  BEGIN
+      IF EXISTS (SELECT 1 FROM "public"."health_evaluations" LIMIT 1) OR
+         EXISTS (SELECT 1 FROM "public"."deployment_stages" LIMIT 1) OR
+         EXISTS (SELECT 1 FROM "public"."deployments" LIMIT 1) OR
+         EXISTS (SELECT 1 FROM "public"."applications" LIMIT 1) OR
+         EXISTS (SELECT 1 FROM "public"."deployment_events" LIMIT 1) THEN
+          RAISE EXCEPTION 'Precondition failed: baseline tables must be empty in the explicitly selected disposable migration-verification database.';
+      END IF;
+  END $$;
+  ```
+  This precondition applies only to an explicitly selected disposable target during a future migration rehearsal. It is not permission to clean, migrate, or test against the existing Compose database. A populated environment requires a separately reviewed migration and backfill plan; Appendix A does not authorize synthetic history.
+
+---
+
+## 2. Core Architectural Principles
+
+1. **PostgreSQL as Authoritative Source of Truth:** All deployment lifecycle states, stage substates, coordinator leases, and fencing epochs reside durably in PostgreSQL. Kubernetes resources and AWS ALB listener rules are external projections reconciled from PostgreSQL.
+2. **No Redis Dependency:** All distributed coordination, fencing, and serialized transitions are implemented using PostgreSQL row locks (`SELECT FOR UPDATE`), conditional updates, and lease timestamps.
+3. **Wall-Clock Timestamping (`clock_timestamp()`):**  
+   `CURRENT_TIMESTAMP` returns the start time of the PostgreSQL transaction. In a transaction that waits for a lock (e.g. `SELECT FOR UPDATE` on `coordinator`), `CURRENT_TIMESTAMP` can be seconds old before the lock is granted. To guarantee lease validity at the exact moment authorization is evaluated, **all lease checks, renewals, acquisitions, and mutation guards MUST use `clock_timestamp()`**, not `CURRENT_TIMESTAMP`.
+4. **Strict Transaction Boundaries for External Operations (Three-Phase Protocol):**  
+   **A database transaction and coordinator row lock MUST NEVER be held across Kubernetes or AWS network calls.**  
+   External operations follow a strict three-phase lifecycle:
+   - **Phase 1 (Pre-operation DB Transaction):** Acquire locks in the defined order, revalidate owner/epoch/expiry after all locks are held, require remaining lease to exceed the configured operation timeout, persist intent, revalidate authorization immediately before commit, and commit to release locks. Timeout values are deployment configuration, not schema defaults.
+   - **Phase 2 (External Network Call):** Call Kubernetes API or AWS ELBv2 API with optimistic concurrency tokens (e.g., `resourceVersion`). Absolutely **NO** database transaction or lock is held during this network call.
+   - **Phase 3 (Post-operation DB Transaction):** Open a fresh transaction, acquire locks in the same order, revalidate lease/epoch after lock acquisition and immediately before commit, and conditionally acknowledge the operation. If ownership is stale or the lease expires, roll back all state and event writes.
+   - *Limitation acknowledged:* A PostgreSQL lock cannot recall a network packet already in flight. Fencing occurs at Phase 3 when acknowledging state.
+5. **Strict Separation of Traffic Tiers:**
+   - **Desired Traffic:** Intent persisted in `deployment_stages` (`desired_canary_pct`, `desired_stable_pct`) and logged as `DESIRED` in `traffic_observations`.
+   - **Applied Traffic:** Kubernetes Ingress configuration written and acknowledged (`applied_canary_pct`, `applied_stable_pct`, `ingress_resource_version`).
+   - **Observed Traffic:** AWS ALB data-plane state confirmed via a two-read stabilized `DescribeRules` verification (`observed_canary_pct`, `observed_stable_pct`, `listener_rule_arn`, `last_observed_at`).
+6. **Configured Routing Weights vs. Live Traffic Telemetry:**  
+   ALB listener-rule forward weights govern connection-distribution configuration at the ALB layer. They verify that the routing configuration is applied and stable; they do not guarantee real-time request counts across targets (which is the domain of Prometheus telemetry in health monitoring).
+7. **Independent Traffic Safety Classification:** `deployments.traffic_safety` tracks whether live user traffic is exposed to target versions (`NOT_EXPOSED`, `EXPOSED`, `VERIFIED_STABLE`, `UNKNOWN`). It is never derived solely from lifecycle state.
+8. **Monotonic Epoch Fencing:** PostgreSQL is authoritative for coordinator owner, lease expiry, and epoch. Every acquisition after an expired or unowned lease increments the epoch, even if the owner identifier is reused; renewal does not. Every state-changing transaction rechecks owner, epoch, and expiry after obtaining its locks and immediately before commit.
+9. **Separate but Serialized Health Result Acceptance and Lifecycle Transitions:**  
+   Result acceptance and lifecycle consumption remain separate transactions. Both acquire the coordinator row and then the same deployment row before touching attempt state. This serializes them and ensures predicates observe current deployment status and revision.
+10. **Guarded Updates with Mandatory Affected-Row Assertion:**  
+   Every state update must conditionally assert expected revisions, substates, and epochs. If `affected_rows != 1`, the transaction MUST ROLLBACK immediately. Dependent inserts (events, observations) must never commit if the preceding update failed.
+
+---
+
+## 3. Schema Delta: Second Migration Specification (`20261010120000_controller_persistence`)
+
+### 3.1 New Enums
+
+```sql
+-- Traffic safety classification
+CREATE TYPE "public"."TrafficSafety" AS ENUM (
+    'NOT_EXPOSED',     -- Verified 0% target traffic before rollout
+    'EXPOSED',         -- Target traffic > 0% active on ALB (or 100% on success)
+    'UNKNOWN',         -- Conservative default when observation is stale, ambiguous, or missing
+    'VERIFIED_STABLE'  -- Post-rollback verified: 100% stable / 0% target on ALB
+);
+
+-- Health evaluation attempt completion state (orthogonal to result)
+CREATE TYPE "public"."EvaluationCompletion" AS ENUM (
+    'RUNNING',         -- In-flight observation window
+    'COMPLETE',        -- Window closed, signals evaluated, result recorded
+    'INCOMPLETE'       -- Abandoned due to crash, epoch change, or revision change
+);
+
+-- Traffic observation record type
+CREATE TYPE "public"."TrafficObservationType" AS ENUM (
+    'DESIRED',         -- PostgreSQL stage intent
+    'APPLIED',         -- Acknowledged Kubernetes Ingress spec
+    'OBSERVED'         -- Verified AWS ALB DescribeRules read
+);
+```
+
+---
+
+### 3.2 Table Alterations
+
+#### 1. Alter `health_evaluations` (Resolving Result Nullability & Single-Running Invariant)
+
+```sql
+-- Comprehensive precondition: all baseline tables must be empty
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM "public"."health_evaluations" LIMIT 1) OR
+       EXISTS (SELECT 1 FROM "public"."deployment_stages" LIMIT 1) OR
+       EXISTS (SELECT 1 FROM "public"."deployments" LIMIT 1) OR
+       EXISTS (SELECT 1 FROM "public"."applications" LIMIT 1) OR
+       EXISTS (SELECT 1 FROM "public"."deployment_events" LIMIT 1) THEN
+        RAISE EXCEPTION 'Precondition failed: baseline tables must be empty before applying migration 20261010120000_controller_persistence';
+    END IF;
+END $$;
+
+-- Make result nullable for running/incomplete attempts
+ALTER TABLE "public"."health_evaluations"
+    ALTER COLUMN "result" DROP NOT NULL;
+
+-- Add attempt tracking columns
+ALTER TABLE "public"."health_evaluations"
+    ADD COLUMN "attempt_id"         TEXT NOT NULL,
+    ADD COLUMN "coordinator_epoch"  INTEGER NOT NULL,
+    ADD COLUMN "completion"         "public"."EvaluationCompletion" NOT NULL DEFAULT 'RUNNING',
+    ADD COLUMN "completed_at"       TIMESTAMPTZ(3),
+    ADD COLUMN "abandonment_reason" TEXT,
+    ADD COLUMN "target_image"       TEXT NOT NULL,
+    ADD COLUMN "consumed_at"        TIMESTAMPTZ(3),
+    ADD COLUMN "consumed_by_revision" INTEGER;
+
+-- Strict database CHECK constraint defining permitted completion/result/timestamp/reason states:
+-- 1. RUNNING: result IS NULL, completed_at IS NULL, abandonment_reason IS NULL
+-- 2. COMPLETE: result IS NOT NULL, completed_at IS NOT NULL, abandonment_reason IS NULL
+-- 3. INCOMPLETE: result IS NULL, completed_at IS NOT NULL, abandonment_reason IS NOT NULL
+ALTER TABLE "public"."health_evaluations"
+    ADD CONSTRAINT "chk_health_eval_completion_state"
+    CHECK (
+        ("completion" = 'RUNNING'    AND "result" IS NULL     AND "completed_at" IS NULL     AND "abandonment_reason" IS NULL) OR
+        ("completion" = 'COMPLETE'   AND "result" IS NOT NULL AND "completed_at" IS NOT NULL AND "abandonment_reason" IS NULL) OR
+        ("completion" = 'INCOMPLETE' AND "result" IS NULL     AND "completed_at" IS NOT NULL AND "abandonment_reason" IS NOT NULL)
+    );
+
+ALTER TABLE "public"."health_evaluations"
+    ADD CONSTRAINT "chk_health_eval_consumption_pair"
+    CHECK (("consumed_at" IS NULL AND "consumed_by_revision" IS NULL)
+        OR ("completion" = 'COMPLETE' AND "consumed_at" IS NOT NULL
+        AND "consumed_by_revision" IS NOT NULL));
+
+-- Unique constraint: exactly one attempt_id per stage per deployment
+CREATE UNIQUE INDEX "uq_health_evals_attempt"
+    ON "public"."health_evaluations"("deployment_id", "stage_id", "attempt_id");
+
+-- PARTIAL UNIQUE INDEX: Guarantees at most ONE attempt can be RUNNING for a given stage/revision
+CREATE UNIQUE INDEX "uq_health_evals_single_running_attempt"
+    ON "public"."health_evaluations"("deployment_id", "stage_id", "deployment_revision")
+    WHERE "completion" = 'RUNNING';
+
+-- Index for epoch-based abandonment queries
+CREATE INDEX "idx_health_evals_by_epoch_completion"
+    ON "public"."health_evaluations"("coordinator_epoch", "completion");
+
+-- Index for stage-level active evaluation lookups
+CREATE INDEX "idx_health_evals_by_stage_completion"
+    ON "public"."health_evaluations"("deployment_id", "stage_id", "completion");
+
+-- Bind the stage foreign key to the same deployment. The baseline has separate
+-- deployment_id and stage_id foreign keys, which alone permit a mismatched pair.
+ALTER TABLE "public"."deployment_stages"
+    ADD CONSTRAINT "uq_deployment_stages_deployment_id_id"
+    UNIQUE ("deployment_id", "id");
+ALTER TABLE "public"."health_evaluations"
+    ADD CONSTRAINT "health_evaluations_deployment_stage_fkey"
+    FOREIGN KEY ("deployment_id", "stage_id")
+    REFERENCES "public"."deployment_stages"("deployment_id", "id")
+    ON DELETE RESTRICT ON UPDATE CASCADE;
+```
+
+#### 2. Alter `deployments` (Adding Traffic Safety State)
+
 ```sql
 ALTER TABLE "public"."deployments"
-    ADD COLUMN "traffic_safety"             TEXT         NOT NULL DEFAULT 'UNKNOWN',
-    ADD COLUMN "traffic_observed_at"        TIMESTAMP(3),
+    ADD COLUMN "traffic_safety"             "public"."TrafficSafety" NOT NULL DEFAULT 'UNKNOWN',
+    ADD COLUMN "traffic_observed_at"        TIMESTAMPTZ(3),
     ADD COLUMN "traffic_observation_source" TEXT;
+
+ALTER TABLE "public"."deployments"
+    ADD CONSTRAINT "chk_deployment_traffic_safety_status"
+    CHECK (("status" = 'ROLLED_BACK' AND "traffic_safety" = 'VERIFIED_STABLE')
+        OR ("status" <> 'ROLLED_BACK' AND "traffic_safety" <> 'VERIFIED_STABLE')),
+    ADD CONSTRAINT "chk_deployment_success_traffic_safety"
+    CHECK ("status" <> 'SUCCEEDED' OR "traffic_safety" = 'EXPOSED');
 ```
 
-Note: `DEFAULT 'UNKNOWN'` is required by PostgreSQL for a `NOT NULL` column addition even though the table is empty at migration time.
+#### 3. Alter `deployment_stages` (Adding Kubernetes & ALB Fencing Metadata)
 
-**3. Add new columns to `deployment_stages`:**
 ```sql
 ALTER TABLE "public"."deployment_stages"
     ADD COLUMN "ingress_uid"              TEXT,
@@ -486,31 +245,63 @@ ALTER TABLE "public"."deployment_stages"
     ADD COLUMN "listener_rule_arn"        TEXT,
     ADD COLUMN "stable_target_group_arn"  TEXT,
     ADD COLUMN "target_target_group_arn"  TEXT,
-    ADD COLUMN "last_observed_at"         TIMESTAMP(3);
+    ADD COLUMN "last_observed_at"         TIMESTAMPTZ(3);
+
+ALTER TABLE "public"."deployment_stages"
+    ADD CONSTRAINT "chk_stage_desired_weights"
+    CHECK ("desired_canary_pct" BETWEEN 0 AND 100
+       AND "desired_stable_pct" BETWEEN 0 AND 100
+       AND "desired_canary_pct" + "desired_stable_pct" = 100),
+    ADD CONSTRAINT "chk_stage_applied_weights"
+    CHECK (("applied_canary_pct" IS NULL AND "applied_stable_pct" IS NULL)
+        OR ("applied_canary_pct" IS NOT NULL AND "applied_stable_pct" IS NOT NULL
+        AND "applied_canary_pct" BETWEEN 0 AND 100
+       AND "applied_stable_pct" BETWEEN 0 AND 100
+       AND "applied_canary_pct" + "applied_stable_pct" = 100)),
+    ADD CONSTRAINT "chk_stage_observed_weights"
+    CHECK (("observed_canary_pct" IS NULL AND "observed_stable_pct" IS NULL)
+        OR ("observed_canary_pct" IS NOT NULL AND "observed_stable_pct" IS NOT NULL
+        AND "observed_canary_pct" BETWEEN 0 AND 100
+       AND "observed_stable_pct" BETWEEN 0 AND 100
+       AND "observed_canary_pct" + "observed_stable_pct" = 100));
+
+CREATE INDEX "idx_stages_by_ingress"
+    ON "public"."deployment_stages"("ingress_uid", "ingress_resource_version");
+
+CREATE INDEX "idx_stages_by_listener_rule"
+    ON "public"."deployment_stages"("listener_rule_arn");
 ```
 
-**4. Add new columns to `health_evaluations`:**
+---
 
-If the open design decision in Section 3.2 resolves to make `result` nullable:
+### 3.3 New Tables
+
+#### 1. Table `coordinator` (Singleton Lease & Epoch Fencing)
+
 ```sql
-ALTER TABLE "public"."health_evaluations"
-    ALTER COLUMN "result" DROP NOT NULL;
+CREATE TABLE "public"."coordinator" (
+    "id"               TEXT         NOT NULL,
+    "owner_id"         TEXT,
+    "epoch"            INTEGER      NOT NULL DEFAULT 0,
+    "lease_expires_at" TIMESTAMPTZ(3) NOT NULL,
+    "renewed_at"       TIMESTAMPTZ(3) NOT NULL,
+    "created_at"       TIMESTAMPTZ(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updated_at"       TIMESTAMPTZ(3) NOT NULL,
+
+    CONSTRAINT "coordinator_pkey" PRIMARY KEY ("id"),
+    CONSTRAINT "chk_coordinator_singleton" CHECK ("id" = 'singleton')
+);
+
+-- Seed singleton record: lease_expires_at at Unix epoch allows immediate takeover
+INSERT INTO "public"."coordinator" (
+    "id", "owner_id", "epoch", "lease_expires_at", "renewed_at", "created_at", "updated_at"
+) VALUES (
+    'singleton', NULL, 0, '1970-01-01 00:00:00.000', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+);
 ```
 
-New columns (all NOT NULL where possible, since the table is empty at migration time):
-```sql
-ALTER TABLE "public"."health_evaluations"
-    ADD COLUMN "attempt_id"         TEXT         NOT NULL,
-    ADD COLUMN "coordinator_epoch"  INTEGER      NOT NULL,
-    ADD COLUMN "completion"         TEXT         NOT NULL,
-    ADD COLUMN "completed_at"       TIMESTAMP(3),
-    ADD COLUMN "abandonment_reason" TEXT,
-    ADD COLUMN "target_image"       TEXT         NOT NULL;
-```
+#### 2. Table `traffic_observations` (Append-Oriented Observation Log)
 
-Note: `NOT NULL` without a `DEFAULT` is valid in PostgreSQL when the table is empty. These columns are added as `NOT NULL` directly because there are no existing rows to violate the constraint.
-
-**5. Create the `traffic_observations` table:**
 ```sql
 CREATE TABLE "public"."traffic_observations" (
     "id"                       TEXT         NOT NULL,
@@ -518,233 +309,1084 @@ CREATE TABLE "public"."traffic_observations" (
     "stage_id"                 TEXT,
     "deployment_revision"      INTEGER      NOT NULL,
     "coordinator_epoch"        INTEGER      NOT NULL,
-    "observation_type"         TEXT         NOT NULL,
-    "stable_weight_pct"        INTEGER      NOT NULL,
-    "target_weight_pct"        INTEGER      NOT NULL,
+    "observation_type"         "public"."TrafficObservationType" NOT NULL,
+    "stable_weight_pct"        INTEGER,
+    "target_weight_pct"        INTEGER,
     "ingress_uid"              TEXT,
     "ingress_resource_version" TEXT,
     "ingress_generation"       INTEGER,
     "listener_rule_arn"        TEXT,
     "target_group_arns"        JSONB,
     "is_fresh"                 BOOLEAN      NOT NULL DEFAULT true,
-    "observed_at"              TIMESTAMP(3) NOT NULL,
-    "created_at"               TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "observed_at"              TIMESTAMPTZ(3) NOT NULL,
+    "created_at"               TIMESTAMPTZ(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-    CONSTRAINT "traffic_observations_pkey" PRIMARY KEY ("id")
+    CONSTRAINT "traffic_observations_pkey" PRIMARY KEY ("id"),
+    CONSTRAINT "traffic_observations_deployment_id_fkey"
+        FOREIGN KEY ("deployment_id") REFERENCES "public"."deployments"("id")
+        ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT "traffic_observations_stage_id_fkey"
+        FOREIGN KEY ("stage_id") REFERENCES "public"."deployment_stages"("id")
+        ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT "chk_traffic_observation_weights"
+        CHECK (("stable_weight_pct" IS NULL AND "target_weight_pct" IS NULL)
+           OR ("stable_weight_pct" IS NOT NULL AND "target_weight_pct" IS NOT NULL
+           AND "stable_weight_pct" BETWEEN 0 AND 100
+           AND "target_weight_pct" BETWEEN 0 AND 100
+           AND "stable_weight_pct" + "target_weight_pct" = 100))
 );
-```
 
-**6. Add foreign keys for `traffic_observations`:**
-```sql
-ALTER TABLE "public"."traffic_observations"
-    ADD CONSTRAINT "traffic_observations_deployment_id_fkey"
-        FOREIGN KEY ("deployment_id") REFERENCES "public"."deployments"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
-
-ALTER TABLE "public"."traffic_observations"
-    ADD CONSTRAINT "traffic_observations_stage_id_fkey"
-        FOREIGN KEY ("stage_id") REFERENCES "public"."deployment_stages"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
-```
-
-**7. Create new indexes:**
-```sql
--- health_evaluations
-CREATE UNIQUE INDEX "uq_health_evals_attempt"
-    ON "public"."health_evaluations"("deployment_id", "stage_id", "attempt_id");
-
-CREATE INDEX "idx_health_evals_by_epoch_completion"
-    ON "public"."health_evaluations"("coordinator_epoch", "completion");
-
-CREATE INDEX "idx_health_evals_by_deployment_stage_epoch"
-    ON "public"."health_evaluations"("deployment_id", "stage_id", "coordinator_epoch", "completion");
-
--- deployment_stages
-CREATE INDEX "idx_stages_by_ingress"
-    ON "public"."deployment_stages"("ingress_uid", "ingress_resource_version");
-
-CREATE INDEX "idx_stages_by_listener_rule"
-    ON "public"."deployment_stages"("listener_rule_arn");
-
--- traffic_observations
-CREATE INDEX "idx_traffic_observations_by_deployment_stage"
+CREATE INDEX "idx_traffic_observations_by_stage"
     ON "public"."traffic_observations"("deployment_id", "stage_id", "observed_at" DESC);
 
-CREATE INDEX "idx_traffic_observations_by_deployment_revision"
+CREATE INDEX "idx_traffic_observations_by_revision"
     ON "public"."traffic_observations"("deployment_id", "deployment_revision", "observation_type");
 
 CREATE INDEX "idx_traffic_observations_by_epoch"
     ON "public"."traffic_observations"("coordinator_epoch", "observation_type");
 ```
 
-### 7.3 Migration ordering rationale
+#### 3. Append-only event idempotency key
 
-The operations above follow this dependency order:
-1. `coordinator` table is independent — created first.
-2. `deployments` columns are independent of new tables — added next.
-3. `deployment_stages` columns are independent of new tables — added next.
-4. `health_evaluations` columns depend on no new tables — added next. If `result` is made nullable, that `ALTER COLUMN` must precede adding `completion` for clarity, but either order is mechanically valid since the table is empty.
-5. `traffic_observations` table depends on `deployments` and `deployment_stages` existing — created after the base tables.
-6. Foreign keys for `traffic_observations` are added after the table is created.
-7. Indexes are created last (no dependencies; can be created in any order).
+Health-result acceptance uses a stable key so its accepted-result event is unique even if a caller retries after losing the commit response. Multiple existing events remain valid because the added key is nullable.
 
-### 7.4 Rollback strategy
+```sql
+ALTER TABLE "public"."deployment_events"
+    ADD COLUMN "idempotency_key" TEXT;
+CREATE UNIQUE INDEX "uq_deployment_events_idempotency_key"
+    ON "public"."deployment_events"("idempotency_key");
+```
 
-Because the database is empty and no data has been written:
-- **Full rollback:** Drop the new tables (`coordinator`, `traffic_observations`) and drop the new columns from `deployments`, `deployment_stages`, and `health_evaluations`. The baseline schema is restored exactly.
-- **No data loss:** There are no rows to lose because the database has not been populated.
-- **Re-apply:** The migration can be re-applied cleanly after any schema corrections.
+---
 
-## 8. Failure scenarios
+## 4. Complete Updated Prisma Model Specification
 
-### 8.1 Coordinator takeover
+When `20261010120000_controller_persistence` is applied, `controller/prisma/schema.prisma` will reflect the complete model:
 
+```prisma
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
 
-**Scenario:** A new coordinator process acquires ownership while the previous process is still running (or crashed without releasing the lease).
+generator client {
+  provider = "prisma-client-js"
+}
 
+enum DeploymentStatus {
+  PENDING
+  DEPLOYING
+  CANARY
+  VALIDATING
+  PROMOTING
+  SUCCEEDED
+  CANARY_FAILED
+  ROLLING_BACK
+  ROLLED_BACK
+  FAILED
+}
 
-**Recovery:**
-1. New coordinator attempts to acquire ownership by locking the `coordinator` row.
-2. If `lease_expires_at < now()`, the lease is expired. The new coordinator increments `epoch`, sets new `owner_id`, and sets a new `lease_expires_at`.
-3. The new epoch invalidates the previous coordinator's authority regardless of whether the previous process has terminated.
-4. The new coordinator queries all `health_evaluations` with `completion = 'RUNNING'` AND `coordinator_epoch < new_epoch` and conditionally marks them `INCOMPLETE` with `abandonment_reason = 'epoch_change'`.
-5. The new coordinator does not abandon attempts with `coordinator_epoch >= new_epoch` (those belong to the current authority).
-6. The new coordinator applies the Kubernetes fencing barrier (Section 9.3 of state machine design) to all managed resources.
-7. Late results from the previous epoch are rejected by the conditional write guard (completion status no longer matches `RUNNING`).
+enum StageStatus {
+  UNEVALUATED
+  INTENT_RECORDED
+  APPLYING
+  APPLIED
+  VALIDATING
+  PASSED
+  FAILED
+}
 
-**Safety guarantee:** Even if the old process is still running and submits a result, the result is rejected because the attempt is marked `INCOMPLETE` and the epoch no longer matches the current authority.
+enum EvaluationResult {
+  PASS
+  FAIL
+  INDETERMINATE
+}
 
-### 8.2 Competing health results
+enum EvaluationCompletion {
+  RUNNING
+  COMPLETE
+  INCOMPLETE
+}
 
-**Scenario:** Two workers (or a stale worker from a previous epoch) attempt to submit results for the same health evaluation attempt.
+enum TrafficSafety {
+  NOT_EXPOSED
+  EXPOSED
+  UNKNOWN
+  VERIFIED_STABLE
+}
 
-**Recovery:**
-1. The first result reads the current coordinator epoch from the coordinator row, then uses a conditional `UPDATE` where `attempt_id` matches, `completion = 'RUNNING'`, `deployment_revision` matches, `stage_id` matches, `coordinator_epoch` matches the current coordinator epoch, and deployment lifecycle is `VALIDATING`.
-2. If the update succeeds, the attempt is marked with the result and `completion` may be set to `'COMPLETE'`.
-3. The second result's conditional `UPDATE` fails because `completion` is no longer `'RUNNING'` (or the revision changed, or the epoch changed).
-4. The second result is discarded and cannot authorize promotion.
+enum TrafficObservationType {
+  DESIRED
+  APPLIED
+  OBSERVED
+}
 
-**Safety guarantee:** Only one result can be accepted per attempt. The conditional update guard with coordinator epoch check prevents duplicate or competing results. Even if a stale worker from a previous epoch is still running, its result is rejected because the epoch no longer matches the current coordinator epoch. Kubernetes does not enforce the epoch annotation; this is application-layer fencing.
+enum DeploymentEventType {
+  DEPLOYMENT_CREATED
+  DEPLOYMENT_STARTED
+  STAGE_INTENT_RECORDED
+  TRAFFIC_APPLY_STARTED
+  TRAFFIC_APPLIED
+  TRAFFIC_VERIFIED
+  HEALTH_VALIDATION_STARTED
+  HEALTH_VALIDATION_PASSED
+  HEALTH_VALIDATION_FAILED
+  PROMOTION_STARTED
+  ROLLBACK_STARTED
+  ROLLBACK_VERIFIED
+  DEPLOYMENT_SUCCEEDED
+  DEPLOYMENT_FAILED
+  DEPLOYMENT_ROLLED_BACK
+}
 
-### 8.3 Same-epoch crashes
+model Coordinator {
+  id             String   @id
+  ownerId        String?  @map("owner_id")
+  epoch          Int      @default(0)
+  leaseExpiresAt DateTime @db.Timestamptz(3) @map("lease_expires_at")
+  renewedAt      DateTime @db.Timestamptz(3) @map("renewed_at")
+  createdAt      DateTime @default(now()) @db.Timestamptz(3) @map("created_at")
+  updatedAt      DateTime @updatedAt @db.Timestamptz(3) @map("updated_at")
 
-**Scenario:** The coordinator process crashes while a health evaluation is in progress, but the epoch does not change (e.g., the process restarts and re-acquires the same lease).
+  @@map("coordinator")
+}
 
-**Recovery:**
-1. The restarted process acquires ownership with the same epoch (if the lease is still valid).
-2. For same-epoch initialization, abandonment of `RUNNING` attempts requires evidence that the attempt's owner is no longer active.
-3. If health evaluation is performed by the coordinator process itself, the process may abandon its own `RUNNING` attempts on restart using the same conditional update procedure.
-4. If health evaluation is performed by separate worker processes, the current architecture does not provide enough information to determine worker liveness safely. A process must not abandon another worker's `RUNNING` attempt without a defined durable worker identity and liveness mechanism (open design decision per Section 9.1 of state machine design).
-5. The restarted process re-observes current traffic state and creates a new attempt with a new `attempt_id` and new window before accepting any health result.
+model Application {
+  id          String       @id @default(uuid())
+  name        String       @unique
+  config      Json         @default("{}")
+  createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @updatedAt @map("updated_at")
+  deployments Deployment[]
 
-**Safety guarantee:** Late results from the abandoned attempt are rejected by the conditional write guard (completion status no longer matches `RUNNING`). The new attempt uses a new identity and follows the approved health-window rules.
+  @@map("applications")
+}
 
-### 8.4 Database outages
+model Deployment {
+  id                        String                @id @default(uuid())
+  applicationId             String                @map("application_id")
+  application               Application           @relation(fields: [applicationId], references: [id])
+  requestIdentity           String                @unique @map("request_identity")
+  targetImage               String                @map("target_image")
+  stableImage               String?               @map("stable_image")
+  desiredReplicas           Int                   @map("desired_replicas")
+  port                      Int
+  strategy                  Json
+  status                    DeploymentStatus      @default(PENDING)
+  currentStageIndex         Int?                  @map("current_stage_index")
+  revision                  Int                   @default(0)
+  rollbackReason            String?               @map("rollback_reason")
+  rollbackOutcome           String?               @map("rollback_outcome")
+  trafficSafety             TrafficSafety         @default(UNKNOWN) @map("traffic_safety")
+  trafficObservedAt         DateTime?             @db.Timestamptz(3) @map("traffic_observed_at")
+  trafficObservationSource  String?               @map("traffic_observation_source")
+  createdAt                 DateTime              @default(now()) @map("created_at")
+  updatedAt                 DateTime              @updatedAt @map("updated_at")
+  completedAt               DateTime?             @map("completed_at")
+  stages                    DeploymentStage[]
+  healthEvaluations         HealthEvaluation[]
+  events                    DeploymentEvent[]
+  trafficObservations       TrafficObservation[]
 
-**Scenario:** PostgreSQL becomes unavailable during a critical operation (e.g., during a lifecycle transition or health result recording).
+  @@index([applicationId, status], map: "idx_deployments_by_app_status")
+  @@index([applicationId, createdAt(sort: Desc)], map: "idx_deployments_by_app")
+  @@map("deployments")
+}
 
-**Recovery:**
-1. The worker cannot commit the transaction. The operation is not persisted.
-2. The worker preserves the last committed state and does not make any lifecycle claim.
-3. The worker cancels in-flight client work where possible and starts no more mutations.
-4. After PostgreSQL recovers, the worker reloads state, re-observes external systems, and reconciles durable intent with actual state.
-5. If the operation was a Kubernetes mutation that succeeded before the database outage, the worker observes the actual Kubernetes state and persists the acknowledgment.
+model DeploymentStage {
+  id                     String               @id @default(uuid())
+  deploymentId           String               @map("deployment_id")
+  deployment             Deployment           @relation(fields: [deploymentId], references: [id])
+  stageIndex             Int                  @map("stage_index")
+  desiredCanaryPct       Int                  @map("desired_canary_pct")
+  desiredStablePct       Int                  @map("desired_stable_pct")
+  appliedCanaryPct       Int?                 @map("applied_canary_pct")
+  appliedStablePct       Int?                 @map("applied_stable_pct")
+  observedCanaryPct      Int?                 @map("observed_canary_pct")
+  observedStablePct      Int?                 @map("observed_stable_pct")
+  status                 StageStatus          @default(UNEVALUATED)
+  operationId            String?              @map("operation_id")
+  operationRevision      Int?                 @map("operation_revision")
+  applyAttempt           Int                  @default(0) @map("apply_attempt")
+  ingressUid             String?              @map("ingress_uid")
+  ingressResourceVersion String?              @map("ingress_resource_version")
+  ingressGeneration      Int?                 @map("ingress_generation")
+  listenerRuleArn        String?              @map("listener_rule_arn")
+  stableTargetGroupArn   String?              @map("stable_target_group_arn")
+  targetTargetGroupArn   String?              @map("target_target_group_arn")
+  lastObservedAt         DateTime?            @db.Timestamptz(3) @map("last_observed_at")
+  validationStartedAt    DateTime?            @map("validation_started_at")
+  validationEndedAt      DateTime?            @map("validation_ended_at")
+  completedAt            DateTime?            @map("completed_at")
+  failureReason          String?              @map("failure_reason")
+  createdAt              DateTime             @default(now()) @map("created_at")
+  updatedAt              DateTime             @updatedAt @map("updated_at")
+  healthEvaluations      HealthEvaluation[]
+  trafficObservations    TrafficObservation[]
 
-**Safety guarantee:** No lifecycle transition or health result is accepted without a durable commit. The system remains in a conservative state until the database is available and state is reconciled.
+  @@unique([deploymentId, stageIndex], map: "deployment_stages_deployment_id_stage_index_key")
+  @@unique([deploymentId, id], map: "uq_deployment_stages_deployment_id_id")
+  @@index([deploymentId, stageIndex], map: "idx_stages_by_deployment")
+  @@index([ingressUid, ingressResourceVersion], map: "idx_stages_by_ingress")
+  @@index([listenerRuleArn], map: "idx_stages_by_listener_rule")
+  @@map("deployment_stages")
+}
 
-### 8.5 Stale ALB observations
+model HealthEvaluation {
+  id                 String               @id @default(uuid())
+  deploymentId       String               @map("deployment_id")
+  deployment         Deployment           @relation(fields: [deploymentId], references: [id])
+  stageId            String               @map("stage_id")
+  stage              DeploymentStage      @relation(fields: [stageId], references: [id])
+  attemptId          String               @map("attempt_id")
+  coordinatorEpoch   Int                  @map("coordinator_epoch")
+  deploymentRevision Int                  @map("deployment_revision")
+  targetImage        String               @map("target_image")
+  windowStart        DateTime             @map("window_start")
+  windowEnd          DateTime?            @map("window_end")
+  completion         EvaluationCompletion @default(RUNNING)
+  result             EvaluationResult?
+  isFresh            Boolean              @default(true) @map("is_fresh")
+  failureReason      String?              @map("failure_reason")
+  abandonmentReason  String?              @map("abandonment_reason")
+  observations       Json                 @default("{}")
+  completedAt        DateTime?            @db.Timestamptz(3) @map("completed_at")
+  consumedAt         DateTime?            @db.Timestamptz(3) @map("consumed_at")
+  consumedByRevision Int?                 @map("consumed_by_revision")
+  createdAt          DateTime             @default(now()) @map("created_at")
+  updatedAt          DateTime             @updatedAt @map("updated_at")
 
-**Scenario:** The controller has an ALB observation that is no longer fresh (e.g., traffic configuration changed but the observation was not updated).
+  @@unique([deploymentId, stageId, attemptId], map: "uq_health_evals_attempt")
+  @@index([deploymentId, stageId, createdAt(sort: Desc)], map: "idx_health_evals_by_stage")
+  @@index([deploymentId, deploymentRevision], map: "idx_health_evals_by_revision")
+  @@index([coordinatorEpoch, completion], map: "idx_health_evals_by_epoch_completion")
+  @@index([deploymentId, stageId, completion], map: "idx_health_evals_by_stage_completion")
+  @@map("health_evaluations")
+}
 
-**Recovery:**
-1. The controller marks `is_fresh = false` for stale observations when a newer observation supersedes them or when a configured freshness bound expires.
-2. Before any promotion or success decision, the controller requires a fresh observation.
-3. If no fresh observation exists, `traffic_safety` is set to `'UNKNOWN'` and no gate passes.
-4. The controller re-observes the ALB state before proceeding.
+model TrafficObservation {
+  id                     String                 @id @default(uuid())
+  deploymentId           String                 @map("deployment_id")
+  deployment             Deployment             @relation(fields: [deploymentId], references: [id])
+  stageId                String?                @map("stage_id")
+  stage                  DeploymentStage?       @relation(fields: [stageId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  deploymentRevision     Int                    @map("deployment_revision")
+  coordinatorEpoch       Int                    @map("coordinator_epoch")
+  observationType        TrafficObservationType @map("observation_type")
+  stableWeightPct        Int?                   @map("stable_weight_pct")
+  targetWeightPct        Int?                   @map("target_weight_pct")
+  ingressUid             String?                @map("ingress_uid")
+  ingressResourceVersion String?                @map("ingress_resource_version")
+  ingressGeneration      Int?                   @map("ingress_generation")
+  listenerRuleArn        String?                @map("listener_rule_arn")
+  targetGroupArns        Json?                  @map("target_group_arns")
+  isFresh                Boolean                @default(true) @map("is_fresh")
+  observedAt             DateTime               @db.Timestamptz(3) @map("observed_at")
+  createdAt              DateTime               @default(now()) @db.Timestamptz(3) @map("created_at")
 
-**Safety guarantee:** Promotion and success decisions require fresh observations. Stale observations do not authorize unsafe transitions.
+  @@index([deploymentId, stageId, observedAt(sort: Desc)], map: "idx_traffic_observations_by_stage")
+  @@index([deploymentId, deploymentRevision, observationType], map: "idx_traffic_observations_by_revision")
+  @@index([coordinatorEpoch, observationType], map: "idx_traffic_observations_by_epoch")
+  @@map("traffic_observations")
+}
 
-### 8.6 Rollback failures
+model DeploymentEvent {
+  id           String              @id @default(uuid())
+  deploymentId String              @map("deployment_id")
+  deployment   Deployment          @relation(fields: [deploymentId], references: [id])
+  eventType    DeploymentEventType @map("event_type")
+  idempotencyKey String?           @unique(map: "uq_deployment_events_idempotency_key") @map("idempotency_key")
+  payload      Json                @default("{}")
+  occurredAt   DateTime            @default(now()) @map("occurred_at")
 
-**Scenario:** The controller attempts to roll back traffic but cannot verify that stable 100% / target 0% is restored (e.g., ALB observation fails or returns inconsistent state).
+  @@index([deploymentId, occurredAt], map: "idx_events_by_deployment")
+  @@index([eventType, occurredAt(sort: Desc)], map: "idx_events_by_type")
+  @@map("deployment_events")
+}
+```
 
-**Recovery:**
-1. The controller remains in `ROLLING_BACK` while the configured retry/exhaustion policy permits.
-2. If the rollback policy is exhausted without a fresh verification of stable 100% / target 0%, the controller transitions to `FAILED`.
-3. The `FAILED` state retains the original canary failure reason and the rollback outcome.
-4. `traffic_safety` is set to `'EXPOSED'` if the latest fresh observation still shows target traffic above zero, or `'UNKNOWN'` if current traffic cannot be determined.
-5. The controller must not claim `VERIFIED_STABLE` without verification.
+### 4.1 Prisma-to-SQL Reconciliation (Prisma 6.16.2)
 
-**Safety guarantee:** `ROLLED_BACK` is only transitioned to when stable 100% / target 0% is freshly verified. If verification cannot complete, the deployment ends in `FAILED` with appropriate `traffic_safety` (not falsely claiming restoration).
+The Prisma model block is the logical model; the reviewed SQL migration is also
+authoritative for database objects that Prisma 6.16.2 cannot express. Physical
+names below must be used verbatim so schema diffs and operations can identify
+the same objects.
 
-## 9. Open design decisions
+| Required database object | Representation |
+|---|---|
+| Baseline unique indexes `applications_name_key`, `deployments_request_identity_key`, `deployment_stages_deployment_id_stage_index_key` | Prisma `@unique` / `@@unique(..., map: ...)` in the model block. |
+| Baseline and new ordinary indexes (`idx_deployments_by_app_status`, `idx_deployments_by_app`, `idx_stages_by_deployment`, `idx_stages_by_ingress`, `idx_stages_by_listener_rule`, `idx_health_evals_by_stage`, `idx_health_evals_by_revision`, `idx_health_evals_by_epoch_completion`, `idx_health_evals_by_stage_completion`, `idx_traffic_observations_by_stage`, `idx_traffic_observations_by_revision`, `idx_traffic_observations_by_epoch`, `idx_events_by_deployment`, `idx_events_by_type`) | Prisma `@@index(..., map: ...)`. |
+| `uq_health_evals_attempt` and `uq_deployment_stages_deployment_id_id` | Prisma `@@unique(..., map: ...)`. |
+| `uq_deployment_events_idempotency_key` | Nullable Prisma `@unique(map: ...)`; PostgreSQL permits multiple NULLs while requiring non-NULL keys to be unique. |
+| `uq_health_evals_single_running_attempt` | Required PostgreSQL partial unique index, created and retained by reviewed raw migration SQL: unique `(deployment_id, stage_id, deployment_revision)` where `completion = 'RUNNING'`. Prisma 6.16.2 has no schema representation for this predicate. It is intentionally absent from the Prisma block, not optional: migration review and disposable-database catalog checks must verify its exact name, columns, uniqueness, and predicate. Do not silently drop or regenerate it away. |
+| Completion/result/timestamp/reason check; paired consumption fields check; weight range/sum checks; `coordinator.id = 'singleton'`; lifecycle/traffic-safety compatibility checks | Required named SQL `CHECK` constraints in the migration. Prisma 6.16.2 does not represent these checks in the model block; verify them directly in migration review and disposable PostgreSQL. |
+| Health evaluation `(deployment_id, stage_id)` must reference the same deployment/stage pair | Required composite SQL foreign key plus its supporting unique key on `deployment_stages(deployment_id, id)`. The Prisma relation remains useful for client navigation; the composite integrity rule is an explicit SQL-only constraint in this Prisma version. |
 
-The following decisions are deferred and require explicit resolution before implementation:
+No SQL object is inferred from a comment or a client-side selector name. `map`
+names the physical index/constraint. Before approval, compare this inventory with
+the complete DDL and ensure no required index or constraint is missing from both
+representations.
 
-1. **Coordinator `owner_id` format:** The exact format of the coordinator owner identifier (process ID, UUID, host-based identifier) is not specified. It must be unique enough to distinguish different coordinator instances.
+---
 
-2. **Same-epoch worker liveness:** For same-epoch process initialization where health evaluation is performed by separate worker processes, the current architecture does not define a durable worker identity or liveness mechanism. The safe behavior is to not abandon another worker's `RUNNING` attempt without evidence that the attempt's owner is no longer active. If individual worker liveness tracking is required, an explicit architecture decision is needed to define worker identity, heartbeats, or liveness tracking.
+## 5. Concurrency Protocols and Transaction Semantics
 
-3. **Observation freshness bound:** The configured freshness bound for traffic observations (how long an observation remains fresh before requiring re-observation) is a required configuration value, not defined in the schema.
+### 5.1 Transaction Boundaries & External Operation Lifecycle (The Three-Phase Protocol)
 
-4. **Lease duration and renewal interval:** The coordinator lease duration and renewal interval are required configuration values, not defined in the schema.
+**Core Safety Invariant:** A PostgreSQL transaction and coordinator row lock **MUST NEVER be held across Kubernetes or AWS network calls**.
 
-5. **Mutation timeout:** The maximum Kubernetes client timeout for mutations is a required configuration value, not defined in the schema.
+External operations adhere to a strict three-phase lifecycle. Lock order for every
+state-changing transaction is coordinator row, deployment row, then affected stage
+and evaluation rows. Revalidate owner, epoch, and expiry with `clock_timestamp()`
+after every potentially blocking lock acquisition, immediately before each
+conditional mutation, and as the last database statement before commit. If the
+lease expires while waiting for a lock, roll back and restart authorization in a
+fresh transaction; do not renew inside the blocked transaction. Keep the
+transaction bounded and perform no application or external work after the final
+authorization check.
 
-6. **Health window duration:** The health evaluation window duration is a required configuration value, not defined in the schema.
+The figure is illustrative; all timing labels in it are non-normative. Use the
+configured operation timeout rule above, not the pictured example. The database
+remains the authority.
 
-7. **`health_evaluations.result` nullability:** Whether `result` should be made nullable to cleanly represent `RUNNING` attempts (see Section 3.2). This must be resolved before the migration is written.
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ Phase 1: Pre-Operation Intent Persistence (Short DB Transaction, ~5ms)          │
+│ - Lock coordinator row (SELECT FOR UPDATE)                                      │
+│ - Validate owner, epoch, and lease_expires_at > clock_timestamp()                │
+│ - Verify lease buffer: (lease_expires_at - clock_timestamp()) >= 5s             │
+│ - Record intent in database (e.g. StageStatus = 'APPLYING', operation_id)       │
+│ - COMMIT TRANSACTION IMMEDIATELY (releases coordinator row lock and connection) │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ Phase 2: External Side-Effect Execution (Outside Any DB Transaction)            │
+│ - Execute Kubernetes Ingress API mutation or AWS ELBv2 DescribeRules read       │
+│ - NO database connection or transaction is held open                            │
+│ - Uses optimistic concurrency tokens (Kubernetes Ingress resourceVersion)       │
+│ - Acknowledges: PostgreSQL cannot recall a network packet already in flight    │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ Phase 3: Post-Operation Acknowledgment (Fresh Short DB Transaction, ~5ms)       │
+│ - Open NEW database transaction                                                 │
+│ - Re-acquire coordinator row lock (SELECT FOR UPDATE)                           │
+│ - Re-validate owner, epoch, and lease_expires_at > clock_timestamp()             │
+│ - Conditionally acknowledge operation (e.g. StageStatus = 'APPLIED')            │
+│ - Assert affected_rows == 1 (if lease lost or epoch changed, ROLLBACK)          │
+│ - COMMIT TRANSACTION IMMEDIATELY                                                │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
 
-8. **Health-observation structure:** The shape of the `observations` JSONB field in `health_evaluations` — field names, units, required vs. optional signals — must be defined before the Health Monitor integration is implemented.
+The universal authorization prelude used in Phase 1 and Phase 3:
 
-9. **Duplicate-payload comparison for `deployment_events`:** If a caller replays an event (same deployment, same event type, same payload), the current schema does not prevent duplicate event rows. If idempotent event recording is required, a deduplication key or unique constraint must be defined.
+```sql
+-- The Universal Controller Authorization Guard (executed in short DB transactions)
+SELECT owner_id, epoch, lease_expires_at
+FROM coordinator
+WHERE id = 'singleton'
+FOR UPDATE;
 
-## 10. Consistency with approved design
+-- Evaluate in application code using clock_timestamp():
+-- IF owner_id != $my_owner_id THEN ROLLBACK; RAISE 'Not coordinator owner';
+-- IF epoch != $my_epoch THEN ROLLBACK; RAISE 'Stale coordinator epoch';
+-- IF lease_expires_at <= clock_timestamp() THEN ROLLBACK; RAISE 'Coordinator lease expired';
+```
 
-This schema design is derived from and consistent with:
+---
 
-- **`CONTROLLER_STATE_MACHINE_DESIGN.md`:** Implements the coordinator epoch fencing, health attempt abandonment protocol, traffic safety tracking, and Kubernetes/ALB observation requirements specified in Sections 1–9.
-- **`ARCHITECTURE.md`:** Implements the deployment lifecycle state machine, stage sub-state protocol, and separation of lifecycle status from traffic safety specified in Section 8.
-- **Safety invariants:** Preserves all safety invariants from Section 1 of the state machine design (conditional transitions, epoch fencing, revision checks, traffic safety separation).
-- **Recovery protocol:** Implements the crash and restart recovery protocol from Section 5 of the state machine design.
+### 5.2 Coordinator Acquisition, Renewal, and Mutation Guard
 
-No contradictions with the approved architecture or state machine design are introduced. Unresolved decisions are documented rather than guessed.
+#### 1. Acquisition Protocol (Process Startup / Takeover)
 
-## Appendix A — Future upgrade scenario: adding these fields to a populated database
+```sql
+BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;
 
-> **This appendix is not a requirement for the initial implementation.** It documents the migration procedure that would be required if this schema were being added to an existing database containing production rows. It is preserved here for reference should the system ever need to be deployed to an environment with pre-existing data.
+-- Lock singleton row
+SELECT owner_id, epoch, lease_expires_at
+FROM coordinator
+WHERE id = 'singleton'
+FOR UPDATE;
 
-### A.1 Staged backfill for `health_evaluations`
+-- Recheck after acquiring the coordinator row lock. A live lease belongs to
+-- its current owner even if this request presents the same owner ID.
+UPDATE coordinator
+SET owner_id = $my_owner_id,
+    epoch = epoch + 1,
+    lease_expires_at = clock_timestamp() + ($lease_duration_sec * INTERVAL '1 second'),
+    renewed_at = clock_timestamp(),
+    updated_at = clock_timestamp()
+WHERE id = 'singleton'
+  AND (owner_id IS NULL OR lease_expires_at <= clock_timestamp())
+RETURNING epoch, lease_expires_at;
 
-If in a future scenario this design were applied to a database with existing `health_evaluations` rows, the following staged approach would be required:
+-- Assert affected_rows == 1; if 0, another active instance holds the lease. ROLLBACK.
+SELECT owner_id = $my_owner_id AND epoch = $new_epoch
+       AND lease_expires_at > clock_timestamp() AS authorized
+FROM coordinator WHERE id = 'singleton';
+-- If false: ROLLBACK. This is the final check before COMMIT.
+COMMIT;
+```
 
-1. Add new columns as nullable: `attempt_id TEXT`, `completion TEXT`, `target_image TEXT`, `coordinator_epoch INTEGER DEFAULT 0`, `completed_at TIMESTAMP(3)`, `abandonment_reason TEXT`.
-2. Backfill existing rows:
-   ```sql
-   UPDATE health_evaluations
-   SET attempt_id = gen_random_uuid()::text,
-       coordinator_epoch = 0,
-       completion = 'COMPLETE',
-       target_image = COALESCE(
-           (SELECT target_image FROM deployments WHERE deployments.id = health_evaluations.deployment_id),
-           'UNKNOWN_TARGET_IMAGE'
-       )
-   WHERE attempt_id IS NULL;
-   ```
-   For rows where the associated deployment no longer has a `target_image`, use `'UNKNOWN_TARGET_IMAGE'` as a sentinel. The controller treats attempts with this sentinel as invalid and does not use them for promotion decisions.
-3. Enforce NOT NULL constraints in a separate migration step after verifying all rows are backfilled:
-   ```sql
-   ALTER TABLE health_evaluations ALTER COLUMN attempt_id SET NOT NULL;
-   ALTER TABLE health_evaluations ALTER COLUMN coordinator_epoch SET NOT NULL;
-   ALTER TABLE health_evaluations ALTER COLUMN completion SET NOT NULL;
-   ALTER TABLE health_evaluations ALTER COLUMN target_image SET NOT NULL;
-   ```
+#### 2. Lease Renewal Protocol (Heartbeat Loop)
 
-### A.2 Conservative backfill for `deployments.traffic_safety`
+```sql
+BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;
 
-For all existing deployments, set `traffic_safety = 'UNKNOWN'`. Do not infer verified traffic state from lifecycle status alone.
+SELECT owner_id, epoch, lease_expires_at
+FROM coordinator
+WHERE id = 'singleton'
+FOR UPDATE;
 
-- Non-terminal deployments enter the reconciliation loop and establish fresh observations before making promotion or rollback decisions.
-- Terminal deployments (`SUCCEEDED`, `ROLLED_BACK`, `FAILED`) retain their lifecycle status with `traffic_safety = 'UNKNOWN'`; this is acceptable because terminal deployments require no further traffic decisions.
+UPDATE coordinator
+SET lease_expires_at = clock_timestamp() + ($lease_duration_sec * INTERVAL '1 second'),
+    renewed_at = clock_timestamp(),
+    updated_at = clock_timestamp()
+WHERE id = 'singleton'
+  AND owner_id = $my_owner_id
+  AND epoch = $my_epoch
+  AND lease_expires_at > clock_timestamp();
 
-### A.3 Rollback safety with existing data
+-- Assert affected_rows == 1. If 0, the lease expired or ownership transferred;
+-- the controller process MUST immediately abdicate and cease mutations.
+-- Recheck owner_id, epoch, and lease_expires_at > clock_timestamp() as the final
+-- statement before commit. COMMIT only if the same owner/epoch remains authorized.
+SELECT owner_id = $my_owner_id AND epoch = $my_epoch
+       AND lease_expires_at > clock_timestamp() AS authorized
+FROM coordinator
+WHERE id = 'singleton';
+-- If false: ROLLBACK.
+COMMIT;
+```
 
-Dropping new columns when rows have been written loses newly collected information (traffic observations, attempt tracking). Rollback is not automatically lossless when data has been written. Staged migrations with application-layer dual-write compatibility may be required if rollback safety is critical in a production scenario.
+#### 3. Pre-Mutation Lease Guard
+
+Before initiating any external write to Kubernetes or AWS ALB (Phase 1), the controller verifies:
+```sql
+SELECT (lease_expires_at - clock_timestamp()) >= ($mutation_timeout_sec * INTERVAL '1 second') AS lease_valid
+FROM coordinator
+WHERE id = 'singleton'
+  AND owner_id = $my_owner_id
+  AND epoch = $my_epoch;
+```
+If `lease_valid` is `false`, the controller triggers synchronous renewal before proceeding. If renewal fails, the operation is aborted.
+
+---
+
+### 5.3 Health Attempt Lifecycle Protocols
+
+#### 1. Attempt Creation Transaction (Short DB Transaction)
+
+```sql
+BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+-- 1. Universal Authorization Guard
+SELECT owner_id, epoch, lease_expires_at FROM coordinator WHERE id = 'singleton' FOR UPDATE;
+-- Assert owner_id == $my_owner_id, epoch == $my_epoch, lease_expires_at > clock_timestamp()
+
+-- 2. Lock and validate the exact active deployment stage
+SELECT d.id
+FROM deployments d
+JOIN deployment_stages s ON s.deployment_id = d.id
+  AND s.stage_index = d.current_stage_index
+WHERE d.id = $deployment_id
+  AND d.status = 'VALIDATING'
+  AND d.revision = $expected_revision
+  AND d.current_stage_index = $stage_index
+  AND d.target_image = $target_image
+  AND s.id = $stage_id
+  AND s.status = 'VALIDATING'
+FOR UPDATE OF d;
+-- Assert exactly one row; recheck coordinator authorization after this lock.
+-- Otherwise ROLLBACK.
+
+-- 3. Insert new attempt with a planned window end bound to one DB timestamp.
+-- Backed by partial unique index "uq_health_evals_single_running_attempt"
+WITH bounds AS (SELECT clock_timestamp() AS window_start)
+INSERT INTO health_evaluations (
+    id, deployment_id, stage_id, attempt_id, coordinator_epoch,
+    deployment_revision, target_image, window_start, window_end, completion,
+    result, is_fresh, observations, created_at, updated_at
+)
+SELECT gen_random_uuid(), $deployment_id, $stage_id, $new_attempt_id, $my_epoch,
+       $expected_revision, $target_image, bounds.window_start,
+       bounds.window_start + ($window_duration_sec * INTERVAL '1 second'),
+       'RUNNING', NULL, true, '{}', clock_timestamp(), clock_timestamp()
+FROM bounds;
+
+INSERT INTO deployment_events
+    (id, deployment_id, event_type, idempotency_key, payload, occurred_at)
+VALUES ($evaluation_id, $deployment_id, 'HEALTH_VALIDATION_STARTED',
+        'health-start:' || $evaluation_id, $payload, clock_timestamp());
+
+-- Recheck owner, epoch, and expiry immediately before commit.
+SELECT owner_id = $my_owner_id AND epoch = $my_epoch
+       AND lease_expires_at > clock_timestamp() AS authorized
+FROM coordinator WHERE id = 'singleton';
+-- If false: ROLLBACK.
+COMMIT;
+```
+
+#### 2. Attempt Abandonment on Epoch Change (Takeover Recovery)
+
+When a new coordinator acquires ownership with `new_epoch > old_epoch`, it first
+commits the new lease/epoch. It then runs this short transaction before creating
+new attempts. The coordinator lock prevents stale owners from accepting results
+while this cleanup runs:
+```sql
+BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+SELECT owner_id, epoch, lease_expires_at
+FROM coordinator WHERE id = 'singleton' FOR UPDATE;
+-- Assert current owner/epoch equal the new owner/new_epoch and lease is live.
+
+SELECT id FROM deployments
+WHERE id IN (SELECT DISTINCT deployment_id FROM health_evaluations
+             WHERE completion = 'RUNNING' AND coordinator_epoch < $new_epoch)
+ORDER BY id
+FOR UPDATE;
+-- Lock deployments before the evaluation rows, matching the common lock order.
+
+UPDATE health_evaluations
+SET completion = 'INCOMPLETE',
+    abandonment_reason = 'epoch_change',
+    completed_at = clock_timestamp(),
+    is_fresh = false,
+    updated_at = clock_timestamp()
+WHERE completion = 'RUNNING'
+  AND coordinator_epoch < $new_epoch;
+
+-- Recheck current coordinator authorization immediately before commit.
+SELECT owner_id = $my_owner_id AND epoch = $new_epoch
+       AND lease_expires_at > clock_timestamp() AS authorized
+FROM coordinator WHERE id = 'singleton';
+-- If false: ROLLBACK.
+COMMIT;
+```
+
+#### 3. Same-epoch restart behavior
+
+Coordinator IDs include a process-lifetime UUID. A process restart therefore
+acquires a new epoch; it cannot silently resume the old owner's live lease.
+Abandonment uses the epoch-change protocol above. If evaluation is later moved to
+separate workers, same-epoch worker liveness and attempt ownership remain an open
+architecture decision; do not abandon their attempts without durable liveness
+evidence.
+
+---
+
+### 5.4 Atomic Health-Result Acceptance and Serialized Lifecycle Consumption
+
+Result acceptance and lifecycle consumption are separate commits: accepting a
+health result never changes deployment status. Both transactions use
+`READ COMMITTED` and the same lock order: coordinator row, deployment row, then
+stage/evaluation rows. The deployment row is the serialization point shared by
+acceptance, abandonment, traffic-state persistence, and every lifecycle
+transition. Do not use a read-then-write transaction without these row locks.
+
+An attempt is identified by the immutable tuple
+`(deployment_id, stage_id, stage_index, deployment_revision, target_image,
+attempt_id, coordinator_epoch)`. The submitted tuple must equal the stored row,
+the stage must belong to the deployment and be its current stage, and the
+deployment target image must still match the snapshot. An attempt can be
+consumed once; `consumed_at` and `consumed_by_revision` are written atomically
+with the lifecycle transition.
+
+#### Transaction A: accept one result, or replay/conflict without overwriting
+
+The API normalizes the submitted result payload before opening the transaction.
+For duplicate comparison, equality means the stored result, failure reason,
+window end, and JSONB observations equal the normalized submitted values. JSONB
+equality is used rather than serialized key order. The unique event key is
+`health-result:<evaluation_id>`.
+
+```sql
+BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+-- Lock and authorize coordinator first.
+SELECT owner_id, epoch, lease_expires_at FROM coordinator
+WHERE id = 'singleton' FOR UPDATE;
+-- Require owner_id = $my_owner_id, epoch = $my_epoch,
+-- lease_expires_at > clock_timestamp(), and $attempt_epoch = $my_epoch.
+
+-- Lock the shared deployment serialization row without filtering lifecycle
+-- state yet, so an exact duplicate can replay after a later transition.
+SELECT id, status, revision, current_stage_index, target_image
+FROM deployments WHERE id = $deployment_id FOR UPDATE;
+-- Require one row; recheck coordinator authorization after this lock.
+
+SELECT id, stage_index, status, deployment_id
+FROM deployment_stages WHERE id = $stage_id
+  AND deployment_id = $deployment_id FOR UPDATE;
+-- Require one row and recheck authorization.
+
+SELECT * FROM health_evaluations
+WHERE id = $evaluation_id
+FOR UPDATE;
+-- Recheck authorization after this lock. Compare every identity-tuple field.
+
+-- If completion = 'COMPLETE':
+--   If result, failure_reason, window_end, and observations equal the stored
+--   values, this is an idempotent replay: make no writes, add no event, and
+--   return the existing accepted result/event ID after the final auth check,
+--   even if the deployment has since advanced. This branch is read-only.
+--   If any value differs, ROLLBACK and return conflict (HTTP 409); never UPDATE.
+-- If completion <> 'RUNNING', or the identity tuple is stale, ROLLBACK and reject.
+-- For RUNNING only, require deployment status=VALIDATING, revision=$expected_revision,
+-- current_stage_index=$stage_index, target_image=$target_image, stage_index=$stage_index,
+-- and stage.status=VALIDATING before the conditional update. Require attempt_epoch=$my_epoch.
+
+UPDATE health_evaluations
+SET result = $result,
+    completion = 'COMPLETE',
+    completed_at = clock_timestamp(),
+    failure_reason = $failure_reason,
+    observations = $observations::jsonb,
+    is_fresh = true,
+    updated_at = clock_timestamp()
+WHERE id = $evaluation_id
+  AND deployment_id = $deployment_id
+  AND stage_id = $stage_id
+  AND attempt_id = $attempt_id
+  AND deployment_revision = $expected_revision
+  AND target_image = $target_image
+  AND coordinator_epoch = $my_epoch
+  AND completion = 'RUNNING'
+  AND window_end = $window_end
+  AND window_end <= clock_timestamp();
+-- Require exactly one row. Zero rows means stale/superseded; ROLLBACK.
+
+INSERT INTO deployment_events
+    (id, deployment_id, event_type, idempotency_key, payload, occurred_at)
+VALUES
+    (gen_random_uuid(), $deployment_id,
+     CASE WHEN $result = 'PASS' THEN 'HEALTH_VALIDATION_PASSED'
+          ELSE 'HEALTH_VALIDATION_FAILED' END,
+     'health-result:' || $evaluation_id, $event_payload, clock_timestamp());
+-- This insert is in the same transaction as the guarded result update.
+
+-- Final statement before commit: recheck current owner, epoch and expiry using
+-- clock_timestamp(). If false, ROLLBACK the result and event together.
+SELECT owner_id = $my_owner_id AND epoch = $my_epoch
+       AND lease_expires_at > clock_timestamp() AS authorized
+FROM coordinator WHERE id = 'singleton';
+COMMIT;
+```
+
+Concurrent duplicate behavior is deterministic by lock order. The first
+transaction to lock and commit the attempt accepts it. A waiting identical
+request then sees `COMPLETE` and returns the stored result without another
+event. A waiting conflicting request sees the same completed row and returns
+409 without changing it. If the first transaction fails any predicate or loses
+authorization, PostgreSQL rolls back both result and event; the next waiter may
+then accept a valid result. A uniqueness violation on the event idempotency key
+also rolls back the result update and is treated as an invariant failure to
+reload and reconcile, never as permission to overwrite.
+
+#### Transaction B: consume exactly one accepted attempt
+
+```sql
+BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+SELECT owner_id, epoch, lease_expires_at FROM coordinator
+WHERE id = 'singleton' FOR UPDATE;
+-- Require current owner/epoch and lease_expires_at > clock_timestamp().
+
+SELECT id, status, revision, current_stage_index, target_image
+FROM deployments WHERE id = $deployment_id FOR UPDATE;
+-- Require one row, then recheck coordinator authorization.
+
+SELECT id, stage_index, status, deployment_id
+FROM deployment_stages WHERE id = $stage_id
+  AND deployment_id = $deployment_id FOR UPDATE;
+-- Require one row, then recheck authorization. For an unconsumed attempt,
+-- require status VALIDATING, expected revision/current_stage_index, matching
+-- target image, matching stage index, and stage status VALIDATING.
+
+SELECT id, result, completion, is_fresh, consumed_at, consumed_by_revision
+FROM health_evaluations
+WHERE id = $evaluation_id
+  AND deployment_id = $deployment_id
+  AND stage_id = $stage_id
+  AND attempt_id = $attempt_id
+  AND deployment_revision = $expected_revision
+  AND target_image = $target_image
+  AND coordinator_epoch = $my_epoch
+FOR UPDATE;
+-- Require COMPLETE, fresh, window_end <= clock_timestamp(), matching tuple and
+-- consumed_at IS NULL. Also require evaluation epoch = current coordinator epoch.
+-- INCOMPLETE, old epoch, stale window, or changed deployment state cannot pass.
+-- If consumed_at is already set, return the prior transition read-only only when
+-- consumed_by_revision = deployments.revision and event key
+-- 'lifecycle:' || evaluation_id exists; otherwise return conflict.
+
+UPDATE health_evaluations
+SET consumed_at = clock_timestamp(),
+    consumed_by_revision = $expected_revision + 1,
+    updated_at = clock_timestamp()
+WHERE id = $evaluation_id
+  AND deployment_id = $deployment_id
+  AND stage_id = $stage_id
+  AND attempt_id = $attempt_id
+  AND completion = 'COMPLETE'
+  AND is_fresh = true
+  AND result = $result
+  AND window_end <= clock_timestamp()
+  AND consumed_at IS NULL
+  AND deployment_revision = $expected_revision
+  AND target_image = $target_image
+  AND coordinator_epoch = $my_epoch;
+-- Require exactly one row or ROLLBACK.
+
+UPDATE deployments
+SET status = $allowlisted_next_status,
+    revision = revision + 1,
+    rollback_reason = CASE WHEN $allowlisted_next_status = 'CANARY_FAILED'
+                           THEN $failure_reason ELSE rollback_reason END,
+    completed_at = CASE WHEN $allowlisted_next_status IN ('SUCCEEDED', 'ROLLED_BACK', 'FAILED')
+                        THEN clock_timestamp() ELSE completed_at END,
+    updated_at = clock_timestamp()
+WHERE id = $deployment_id
+  AND status = 'VALIDATING'
+  AND revision = $expected_revision
+  AND current_stage_index = $stage_index
+  AND target_image = $target_image;
+-- Require exactly one row. Otherwise ROLLBACK consumption and all events.
+
+INSERT INTO deployment_events
+    (id, deployment_id, event_type, idempotency_key, payload, occurred_at)
+VALUES (gen_random_uuid(), $deployment_id, $lifecycle_event_type,
+        'lifecycle:' || $evaluation_id, $event_payload, clock_timestamp());
+
+-- Final authorization recheck with clock_timestamp(); then COMMIT.
+```
+
+The next-status value is selected from the approved lifecycle transition table,
+never accepted directly from an API caller. `PASS` can promote an intermediate
+stage; final success additionally requires the approved final-stage and verified
+100%-target traffic predicates. `FAIL` enters the canary-failure/rollback path.
+`INDETERMINATE` never promotes; its exhaustion policy remains open below.
+
+If a retry finds `consumed_at` already set, it may return the prior transition
+only when `consumed_by_revision = deployments.revision`, the stable lifecycle
+idempotency event exists, and the submitted identity matches. It must not run a
+second transition. Otherwise return conflict. Because consumption, deployment
+revision/status, and event insertion commit together, any failed conditional
+mutation rolls all of them back. If a lifecycle transition commits first, later
+result acceptance fails the deployment-state/revision predicate and cannot
+override it.
+
+---
+
+### 5.5 Stage Substate & Traffic Transition Protocols (Three-Phase Separation)
+
+#### 1. Persist Intent (`INTENT_RECORDED` - Short DB Transaction)
+```sql
+BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+-- 1. Universal Authorization Guard
+SELECT owner_id, epoch, lease_expires_at FROM coordinator WHERE id = 'singleton' FOR UPDATE;
+-- Assert owner_id == $my_owner_id, epoch == $my_epoch, lease_expires_at > clock_timestamp()
+
+-- 2. Guarded stage update
+UPDATE deployment_stages
+SET status = 'INTENT_RECORDED',
+    desired_canary_pct = $target_pct,
+    desired_stable_pct = $stable_pct,
+    operation_id = $op_id,
+    operation_revision = $expected_revision,
+    apply_attempt = apply_attempt + 1,
+    updated_at = clock_timestamp()
+WHERE id = $stage_id
+  AND deployment_id = $deployment_id
+  AND status IN ('UNEVALUATED', 'FAILED');
+
+-- Assert affected_rows == 1; IF 0 THEN ROLLBACK; RAISE 'Stage update conflict';
+
+-- 3. Record desired observation
+INSERT INTO traffic_observations (
+    id, deployment_id, stage_id, deployment_revision, coordinator_epoch,
+    observation_type, stable_weight_pct, target_weight_pct, is_fresh, observed_at
+) VALUES (
+    gen_random_uuid(), $deployment_id, $stage_id, $expected_revision, $my_epoch,
+    'DESIRED', $stable_pct, $target_pct, true, clock_timestamp()
+);
+
+-- 4. Record audit event
+INSERT INTO deployment_events (id, deployment_id, event_type, payload, occurred_at)
+VALUES (gen_random_uuid(), $deployment_id, 'STAGE_INTENT_RECORDED', $payload, clock_timestamp());
+
+COMMIT;
+```
+
+#### 2. Apply Kubernetes Ingress (Three-Phase Protocol)
+
+- **Phase 1: Record Intent `APPLYING` (Short DB Transaction):**
+  Use the common lock order and configured mutation-timeout guard, update `deployment_stages.status = 'APPLYING'` (assert `affected_rows == 1`), recheck authorization, then commit.
+- **Phase 2: Mutate Ingress (Outside DB Transaction):**
+  Issue HTTP write to Kubernetes API with optimistic concurrency (`resourceVersion`). No DB connection held.
+- **Phase 3: Acknowledge `APPLIED` (Short DB Transaction):**
+```sql
+BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+-- 1. Universal Authorization Guard (fresh lock)
+SELECT owner_id, epoch, lease_expires_at FROM coordinator WHERE id = 'singleton' FOR UPDATE;
+-- Assert owner_id == $my_owner_id, epoch == $my_epoch, lease_expires_at > clock_timestamp()
+
+-- 2. Guarded stage update
+UPDATE deployment_stages
+SET status = 'APPLIED',
+    applied_canary_pct = $target_pct,
+    applied_stable_pct = $stable_pct,
+    ingress_uid = $ingress_uid,
+    ingress_resource_version = $ingress_version,
+    ingress_generation = $ingress_gen,
+    updated_at = clock_timestamp()
+WHERE id = $stage_id
+  AND deployment_id = $deployment_id
+  AND status = 'APPLYING';
+
+-- Assert affected_rows == 1; IF 0 THEN ROLLBACK; RAISE 'Stage update conflict';
+
+-- 3. Record applied observation
+INSERT INTO traffic_observations (
+    id, deployment_id, stage_id, deployment_revision, coordinator_epoch,
+    observation_type, stable_weight_pct, target_weight_pct, ingress_uid,
+    ingress_resource_version, ingress_generation, is_fresh, observed_at
+) VALUES (
+    gen_random_uuid(), $deployment_id, $stage_id, $expected_revision, $my_epoch,
+    'APPLIED', $stable_pct, $target_pct, $ingress_uid, $ingress_version, $ingress_gen, true, clock_timestamp()
+);
+
+-- 4. Record audit event
+INSERT INTO deployment_events (id, deployment_id, event_type, payload, occurred_at)
+VALUES (gen_random_uuid(), $deployment_id, 'TRAFFIC_APPLIED', $payload, clock_timestamp());
+
+COMMIT;
+```
+
+#### 3. Complete ALB Data-Plane Verification Protocol (`VALIDATING`)
+
+A single ALB read must **never** establish verified traffic or authorize promotion. The observation protocol strictly separates external reads from database commits:
+
+- **External Observation Steps (Executed outside any DB transaction):**
+  1. **Kubernetes read 1:** Read the Ingress and capture UID, resourceVersion, generation, host/path, and the intended operation ID/revision metadata.
+  2. Map that exact host/path to one managed AWS ELBv2 listener rule; ambiguity or multiple matches fails closed.
+  3. **ALB read 1 ($T_0$):** Call `DescribeRules`; capture the listener rule ARN, target group ARNs, action digest, and configured forward weights.
+  4. Wait the configured stabilization interval outside any database transaction.
+  5. **ALB read 2 ($T_1$):** Call `DescribeRules` again. Require the same rule, target groups, action digest, and weights as read 1.
+  6. **Kubernetes read 2:** Re-read the Ingress. Require the same UID, resourceVersion, generation, host/path, operation ID, and revision as read 1 and the persisted APPLIED intent.
+  7. In a short database transaction, acquire coordinator, deployment, and stage locks in that order. Revalidate owner/epoch/expiry with `clock_timestamp()` after locks and check deployment revision, active stage, operation ID, and expected lifecycle status. Reject the observation if any identity changed during the external reads.
+  8. Persist the matched observation conditionally with those identity predicates; recheck coordinator authorization immediately before commit.
+  9. **Safety determination:**
+     - Target weight == 0% and stable == 100% during rollback: `traffic_safety = 'VERIFIED_STABLE'`
+     - Target weight == 0% prior to rollout: `traffic_safety = 'NOT_EXPOSED'`
+     - Target weight > 0%: `traffic_safety = 'EXPOSED'`
+     - Unstable, contradictory, or unmappable: persist an observation with nullable weights and `is_fresh = false`; set current safety to `UNKNOWN`.
+
+These ALB weights describe configured routing weights. They do not prove exact
+live request proportions. Live request distribution belongs to telemetry and
+health evaluation, not this verification gate.
+
+- **Post-Verification Acknowledgment (Short DB Transaction):**
+```sql
+BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+-- 1. Universal Authorization Guard (fresh lock)
+SELECT owner_id, epoch, lease_expires_at FROM coordinator WHERE id = 'singleton' FOR UPDATE;
+-- Assert owner_id == $my_owner_id, epoch == $my_epoch, lease_expires_at > clock_timestamp()
+
+-- 2. Lock the same deployment row used by health acceptance/lifecycle changes.
+SELECT id FROM deployments
+WHERE id = $deployment_id
+  AND revision = $expected_revision
+  AND status = $expected_deployment_status
+  AND current_stage_index = $stage_index
+FOR UPDATE;
+-- Require one row and recheck coordinator authorization after this lock.
+
+SELECT id FROM deployment_stages
+WHERE id = $stage_id
+  AND deployment_id = $deployment_id
+  AND stage_index = $stage_index
+  AND operation_id = $op_id
+  AND operation_revision = $expected_revision
+  AND status = 'APPLIED'
+FOR UPDATE;
+-- Require one row; recheck coordinator authorization.
+
+-- 3. Persist the observation only for the exact deployment/stage operation.
+UPDATE deployment_stages
+SET status = CASE WHEN $is_rollback THEN status ELSE 'VALIDATING' END,
+    observed_canary_pct = $observed_target_pct,
+    observed_stable_pct = $observed_stable_pct,
+    listener_rule_arn = $rule_arn,
+    stable_target_group_arn = $stable_tg_arn,
+    target_target_group_arn = $target_tg_arn,
+    last_observed_at = clock_timestamp(),
+    validation_started_at = CASE WHEN $is_rollback THEN validation_started_at ELSE clock_timestamp() END,
+    updated_at = clock_timestamp()
+WHERE id = $stage_id
+  AND deployment_id = $deployment_id
+  AND operation_id = $op_id
+  AND operation_revision = $expected_revision
+  AND status = 'APPLIED';
+
+-- Assert affected_rows == 1; IF 0 THEN ROLLBACK; RAISE 'Stage update conflict';
+
+-- 4. Update deployment safety and, only for verified rollback, terminal status
+UPDATE deployments
+SET traffic_safety = CASE
+        WHEN $is_rollback AND $weights_match AND $observed_stable_pct = 100
+             AND $observed_target_pct = 0 THEN 'VERIFIED_STABLE'
+        WHEN $weights_match AND $observed_target_pct > 0 THEN 'EXPOSED'
+        WHEN $weights_match AND $observed_target_pct = 0 AND $no_prior_target_exposure THEN 'NOT_EXPOSED'
+        WHEN NOT $weights_match THEN 'UNKNOWN'
+        ELSE traffic_safety
+    END,
+    status = CASE WHEN $is_rollback AND $weights_match
+                       AND $observed_stable_pct = 100 AND $observed_target_pct = 0
+                  THEN 'ROLLED_BACK' ELSE status END,
+    revision = revision + CASE WHEN $is_rollback AND $weights_match
+                                    AND $observed_stable_pct = 100 AND $observed_target_pct = 0
+                               THEN 1 ELSE 0 END,
+    completed_at = CASE WHEN $is_rollback AND $weights_match
+                             AND $observed_stable_pct = 100 AND $observed_target_pct = 0
+                        THEN clock_timestamp() ELSE completed_at END,
+    traffic_observed_at = clock_timestamp(),
+    traffic_observation_source = 'alb_describe_rules_stabilized',
+    updated_at = clock_timestamp()
+WHERE id = $deployment_id
+  AND revision = $expected_revision
+  AND current_stage_index = $stage_index
+  AND status = $expected_deployment_status;
+
+-- Assert affected_rows == 1; IF 0 THEN ROLLBACK; RAISE 'Deployment update conflict';
+
+-- 5. Append matched (or explicitly unknown) observation; weights are both NULL
+-- when ALB configuration could not be unambiguously parsed or matched.
+INSERT INTO traffic_observations (
+    id, deployment_id, stage_id, deployment_revision, coordinator_epoch,
+    observation_type, stable_weight_pct, target_weight_pct, listener_rule_arn,
+    target_group_arns, is_fresh, observed_at
+) VALUES (
+    gen_random_uuid(), $deployment_id, $stage_id, $expected_revision, $my_epoch,
+    'OBSERVED', $observed_stable_pct, $observed_target_pct, $rule_arn,
+    $tg_arns_json, $weights_match, clock_timestamp()
+);
+
+-- 6. Record a verified event only for a matched observation.
+INSERT INTO deployment_events
+    (id, deployment_id, event_type, idempotency_key, payload, occurred_at)
+SELECT gen_random_uuid(), $deployment_id,
+       CASE WHEN $is_rollback THEN 'ROLLBACK_VERIFIED' ELSE 'TRAFFIC_VERIFIED' END,
+       'traffic-observed:' || $op_id || ':' || $expected_revision,
+       $payload, clock_timestamp()
+WHERE $weights_match
+  AND (NOT $is_rollback OR ($observed_stable_pct = 100 AND $observed_target_pct = 0));
+
+-- Final authorization recheck with clock_timestamp(); any failed predicate or
+-- row count rolls back observation, traffic state, terminal transition, event.
+COMMIT;
+```
+
+For rollback, `ROLLING_BACK -> ROLLED_BACK` and `traffic_safety = VERIFIED_STABLE`
+are written in this same transaction and only when both reads agree on stable
+100% / target 0%, Kubernetes identity still matches, and the deployment remains
+at the expected rollback revision. If rollback retries are exhausted before
+that proof, transition to `FAILED` with safety `EXPOSED` when fresh reads show
+target weight above zero, otherwise `UNKNOWN`; never write `VERIFIED_STABLE` and
+never report traffic as restored. `FAILED` is a lifecycle outcome, not a traffic
+safety assertion.
+
+---
+
+## 6. Review Issue Resolution Register
+
+| Review issue | Proposed resolution in this revision | Remaining boundary |
+|---|---|---|
+| Atomic health-result acceptance | One `READ COMMITTED` transaction locks coordinator → deployment → stage/evaluation, conditionally changes only `RUNNING` to `COMPLETE`, and inserts the accepted-result event in the same transaction. Any failed predicate, unique-key violation, or final authorization check rolls back both writes. | Outcome normalization and the chosen HTTP conflict response need implementation review. |
+| Lifecycle serialization | Acceptance and lifecycle consumption lock the same deployment row. Both predicates bind deployment status/revision/current stage, stage ID/index/status, target image, evaluation ID/attempt ID, and coordinator epoch. | Lifecycle table remains the source of allowed `$next_status`; implementation must not accept it from callers. |
+| Coordinator fencing | PostgreSQL lease is authoritative. Lock order and post-lock/pre-mutation/final pre-commit checks use `clock_timestamp()`. Expiry while waiting causes rollback; renewal is a separate transaction. Acquisition increments epoch only after an unowned/expired lease; renewal requires a live lease and exact owner/epoch. | Short transaction/statement/lock timeout values remain deployment configuration. The final DB check is not a Kubernetes-side epoch fence. |
+| Duplicate result semantics | First serialized valid commit wins. Exact replay compares stored result, failure reason, planned window end, and JSONB observations; it returns the existing result/event without writes. A conflicting replay returns conflict and never updates the completed attempt. The unique result event key is per evaluation. | Decide the external API status/body for conflict and replay. |
+| Attempt binding/consumption | Immutable tuple binds deployment, stage/index, revision, target image, attempt ID, and creation epoch. Consumption requires current epoch and a fresh complete result; `consumed_at` and `consumed_by_revision` commit atomically with one transition. | Whether `INDETERMINATE` remains VALIDATING or enters failure after a configured policy is open. |
+| ALB verification | Two Kube identity reads bracket two identical ALB rule reads separated by configured stabilization; then a locked DB transaction revalidates owner/epoch/revision/stage/operation before persisting. Weights represent configured routing, not exact request proportions. | Rule discovery, freshness/stabilization intervals, and read retries need deployment-specific configuration. |
+| Prisma/SQL consistency | Explicit `map` names for represented indexes; named SQL checks and composite FK are listed. The running-attempt partial unique index is identified as required migration-only SQL because Prisma 6.16.2 cannot model its predicate. | Review the raw migration and verify this index and all check constraints in a disposable PostgreSQL catalog. |
+| Migration safety | Existing `20261009135031_init` is immutable and its recovered checksum is recorded above. New required fields have no fabricated historical values. Populated targets require separately approved, source-derived staged backfills; otherwise migration stops. | Approval of any future migration/backfill is separate from approval of this design. |
+| Traffic safety/rollback | `FAILED` retains `EXPOSED` or `UNKNOWN`; it never asserts restoration. Only a matching two-read proof can atomically set `ROLLING_BACK → ROLLED_BACK` with `VERIFIED_STABLE`. Unknown state fails closed and alerts; exhaustion ends in `FAILED`, not `ROLLED_BACK`. | Rollback retry/exhaustion policy and alert destination remain configuration/operations decisions. |
+| Deterministic concurrency tests | Explicit two-session schedules and expected persisted rows/events are listed in Section 7. | Tests must run only on a separate disposable database after design approval. |
+
+## 7. Deterministic Concurrency Test Plan (Design Only)
+
+All scenarios use a separate disposable PostgreSQL database with two explicit
+sessions and test barriers/locks, not timing sleeps. Assert transaction results,
+deployment revision/status, attempt state, traffic safety, and exact event count.
+
+| Scenario | Deterministic schedule | Required assertion |
+|---|---|---|
+| Result acceptance vs. attempt abandonment | A begins acceptance and locks coordinator/deployment/evaluation; B begins takeover/abandonment and blocks on coordinator. Commit A, then allow B to acquire a higher epoch and run abandonment. Repeat with B acquiring first. | First order: accepted result remains COMPLETE and abandonment updates zero rows for it. Second order: attempt becomes INCOMPLETE and A is rejected as stale. No attempt is both accepted and abandoned; no duplicate event. |
+| Result acceptance vs. lifecycle transition | A and B contend for the same coordinator and deployment row. Run A first then B; repeat B first then A with B representing a competing terminal/failure transition. | If acceptance commits first, only a transition consuming that exact evaluation at expected revision can advance. If lifecycle commits first, acceptance sees changed status/revision and writes neither result nor event. |
+| Identical duplicate submissions | A accepts and commits; B submits the byte/normalized-equivalent payload after waiting on the attempt row. Also simulate A's response being lost, then replay. | Both callers receive the same accepted evaluation/event identity; one stored result and exactly one accepted-result event. B makes no write. |
+| Conflicting concurrent submissions | A locks the attempt and submits PASS; B submits FAIL for the same tuple and waits. Reverse lock order in a second run. | The first valid serialized commit remains immutable. The second gets conflict; no overwrite, no second accepted event, no lifecycle transition from the rejected value. |
+| Stale coordinator epoch | Replace the current owner/epoch, then submit using the former epoch; also test a request that waited for coordinator lock across takeover. | Authorization fails after lock acquisition; no result, event, or lifecycle mutation commits. |
+| Lease renewal vs. takeover | Renewal and takeover contend on the coordinator row. Exercise renewal while live and takeover after expiry. | Exactly one wins according to the row-locked `clock_timestamp()` predicate. Renewal never resurrects an expired lease; takeover increments epoch once; loser changes nothing. |
+| Lease expires while waiting for a lock | Hold deployment row in session A. In session B, acquire coordinator lock while valid, then block on deployment row until lease expiry; release A. | B rechecks expiry after acquiring deployment lock, rolls back, and persists no mutation/event. A fresh renewal/takeover is required. |
+| Duplicate attempt consumption | Two lifecycle consumers submit the same evaluation; first locks and commits, second waits and retries. | One updates `consumed_at`, one increments deployment revision, and one lifecycle event is stored. Retry returns prior transition only when idempotency event/revision match; otherwise conflict. |
+| Conditional mutation failure and transaction rollback | Force the deployment revision/status predicate or event unique key to fail after the evaluation/consumption update but before commit. | Entire transaction rolls back: evaluation completion/consumption, deployment status/revision, observations, and events remain at their pre-transaction values. |
+
+## 8. Migration Safety and Disposable Verification Plan
+
+The existing baseline SQL and `migration_lock.toml` remain unchanged. Before any
+future migration is approved, verify its parent migration name/checksum and
+catalog against the recovered baseline. Never edit `_prisma_migrations` to make
+history appear consistent, and never apply a generated migration to the current
+Compose database as a test.
+
+Rehearse only against a separate disposable PostgreSQL instance/project/volume:
+
+1. Build an isolated working copy from the recovered baseline schema, original
+   migration SQL, and lock file; point only that copy at the disposable DB.
+2. Apply the proposed next migration there, then compare every Prisma field,
+   physical index name/definition, CHECK, FK, enum, default, and nullability with
+   the resulting catalog. Specifically assert the partial-index predicate
+   `completion = 'RUNNING'` and all weight/status checks.
+3. Verify `migrate status` reports the baseline and proposed migration complete,
+   and verify the first migration checksum remains byte-for-byte unchanged.
+4. Run the deterministic concurrency scenarios from Section 7 on a fresh test
+   database. Tear down only the disposable resources after review.
+
+For any populated future target, add new columns nullable first, backfill only
+from authoritative existing data or an explicitly reviewed operator-supplied
+mapping, validate row counts and semantic invariants, then add `NOT NULL` and
+checks in a later step. Do not invent attempt IDs, coordinator epochs, target
+images, completion outcomes, or traffic-safety values. If a required value
+cannot be derived without guessing, stop and request a separate migration/data
+decision; do not use sentinels or mark historical attempts COMPLETE by inference.
+
+## 9. Remaining Open Decisions and Review Request
+
+These values and policies are deliberately not invented here:
+
+- Health window duration, minimum duration, missing-signal wait, and signal
+  freshness bounds.
+- Coordinator lease duration, renewal cadence, and operation-specific timeouts.
+- ALB stabilization interval, observation freshness bound, discovery/read retry
+  limits, and traffic exposure definition for an unknown write outcome.
+- Whether `INDETERMINATE` leaves the deployment in `VALIDATING` or triggers the
+  configured failure/rollback policy after its retry budget.
+- Rollback retry/exhaustion policy and alert destination for `FAILED/EXPOSED` or
+  `FAILED/UNKNOWN`.
+- Whether the single in-process health evaluator remains a permanent MVP
+  constraint; separate workers require durable worker identity/liveness design.
+- Whether the team accepts the required partial unique index and named SQL-only
+  checks/composite FK as migration-managed objects under Prisma 6.16.2, or plans
+  a separately approved Prisma upgrade before implementation.
+- API response contract for exact replay versus conflicting result submission.
+
+**Review requested.** This is a revised proposal only. The design is not approved;
+no schema, application code, migration, or database change is authorized by this
+document. Please review the issue register, SQL-only invariant inventory,
+concurrency schedules, and open decisions before deciding whether Step 5 can be
+approved.
